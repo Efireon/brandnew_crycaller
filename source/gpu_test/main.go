@@ -27,17 +27,33 @@ type GPUInfo struct {
 }
 
 type GPURequirement struct {
-	Name        string `json:"name"`
-	MinPCILines int    `json:"min_pci_lines"`
-	MinMemoryMB int    `json:"min_memory_mb"`
-	Driver      string `json:"driver"`
-	Vendor      string `json:"vendor"`
-	MinCount    int    `json:"min_count"`
+	Name        string   `json:"name"`
+	MinPCILines int      `json:"min_pci_lines"`
+	MinMemoryMB int      `json:"min_memory_mb"`
+	Driver      string   `json:"driver"`
+	Vendor      string   `json:"vendor"`
+	DeviceIDs   []string `json:"device_ids,omitempty"`
+	MinCount    int      `json:"min_count"`
+}
+
+type DeviceVisual struct {
+	Symbol      string `json:"symbol"`
+	ShortName   string `json:"short_name"`
+	Description string `json:"description"`
+	Color       string `json:"color"`
+}
+
+type VisualizationConfig struct {
+	DeviceMap  map[string]DeviceVisual `json:"device_map"`  // device_id -> visual
+	PCIToSlot  map[string]int          `json:"pci_to_slot"` // PCI address -> logical slot number
+	TotalSlots int                     `json:"total_slots"` // Total number of slots to show
+	SlotWidth  int                     `json:"slot_width"`
 }
 
 type Config struct {
-	GPURequirements []GPURequirement `json:"gpu_requirements"`
-	CheckPower      bool             `json:"check_power"`
+	GPURequirements []GPURequirement    `json:"gpu_requirements"`
+	Visualization   VisualizationConfig `json:"visualization"`
+	CheckPower      bool                `json:"check_power"`
 }
 
 // ANSI color codes
@@ -83,6 +99,7 @@ func showHelp() {
 	fmt.Println("  -c <path>   Path to configuration file")
 	fmt.Println("  -s          Create default configuration file")
 	fmt.Println("  -l          List detected GPUs without configuration check")
+	fmt.Println("  -vis        Show visual PCIe slots layout")
 	fmt.Println("  -d          Show detailed debug information")
 	fmt.Println("  -h          Show this help")
 }
@@ -93,119 +110,122 @@ func createDefaultConfig(configPath string) error {
 	// Get current GPU information
 	gpus, err := getGPUInfo()
 	if err != nil {
-		printWarning(fmt.Sprintf("Could not scan GPUs: %v", err))
-		printInfo("Creating minimal default configuration...")
-		return createMinimalConfig(configPath)
+		return fmt.Errorf("could not scan GPUs: %v", err)
 	}
 
 	if len(gpus) == 0 {
-		printWarning("No GPU devices found in system")
-		printInfo("Creating minimal default configuration...")
-		return createMinimalConfig(configPath)
+		return fmt.Errorf("no GPU devices found in system - cannot create configuration")
 	}
 
 	printInfo(fmt.Sprintf("Found %d GPU device(s), creating configuration based on detected hardware:", len(gpus)))
 
 	var requirements []GPURequirement
+	deviceMap := make(map[string]DeviceVisual)
+	pciToSlot := make(map[string]int)
 
-	// Display found GPUs and create requirements
-	for i, gpu := range gpus {
-		printInfo(fmt.Sprintf("  GPU %d: %s (%s)", i+1, gpu.Name, gpu.Vendor))
-		printInfo(fmt.Sprintf("    PCI Slot: %s, Physical Slot: %s", gpu.PCISlot, gpu.PhysicalSlot))
-		printInfo(fmt.Sprintf("    PCI Lines: %d, Memory: %d MB, Driver: %s", gpu.PCILines, gpu.MemoryMB, gpu.Driver))
+	// Sort GPUs by Physical Slot if available, otherwise by PCI address
+	sortedGPUs := make([]GPUInfo, len(gpus))
+	copy(sortedGPUs, gpus)
 
-		// Create requirement based on this GPU
-		req := GPURequirement{
-			Name:     fmt.Sprintf("%s GPU", capitalizeVendor(gpu.Vendor)),
-			Vendor:   gpu.Vendor,
-			MinCount: 1,
-		}
-
-		// Set PCI lanes requirement (with some tolerance)
-		if gpu.PCILines > 0 {
-			req.MinPCILines = gpu.PCILines
-		} else {
-			// Default reasonable values based on vendor
-			switch gpu.Vendor {
-			case "nvidia":
-				req.MinPCILines = 16
-			case "amd":
-				req.MinPCILines = 16
-			case "intel":
-				req.MinPCILines = 4
-			default:
-				req.MinPCILines = 8
+	// Simple sorting by PCI address for now (can be improved to use Physical Slot)
+	for i := 0; i < len(sortedGPUs)-1; i++ {
+		for j := i + 1; j < len(sortedGPUs); j++ {
+			if sortedGPUs[i].PCISlot > sortedGPUs[j].PCISlot {
+				sortedGPUs[i], sortedGPUs[j] = sortedGPUs[j], sortedGPUs[i]
 			}
-		}
-
-		// Set memory requirement (use detected or reasonable default)
-		if gpu.MemoryMB > 0 {
-			// Use detected memory as minimum requirement
-			req.MinMemoryMB = gpu.MemoryMB
-		} else {
-			// Default reasonable values based on vendor
-			switch gpu.Vendor {
-			case "nvidia":
-				req.MinMemoryMB = 4096
-			case "amd":
-				req.MinMemoryMB = 4096
-			case "intel":
-				req.MinMemoryMB = 1024
-			default:
-				req.MinMemoryMB = 2048
-			}
-		}
-
-		// Set driver requirement if known
-		if gpu.Driver != "unknown" && gpu.Driver != "" {
-			req.Driver = gpu.Driver
-		}
-
-		// Check if we already have a requirement for this vendor
-		existingIndex := -1
-		for j, existing := range requirements {
-			if existing.Vendor == gpu.Vendor {
-				existingIndex = j
-				break
-			}
-		}
-
-		if existingIndex >= 0 {
-			// Update existing requirement
-			existing := &requirements[existingIndex]
-			existing.MinCount++
-
-			// Use the higher memory requirement
-			if req.MinMemoryMB > existing.MinMemoryMB {
-				existing.MinMemoryMB = req.MinMemoryMB
-			}
-
-			// Use the higher PCI lanes requirement
-			if req.MinPCILines > existing.MinPCILines {
-				existing.MinPCILines = req.MinPCILines
-			}
-
-			// Update name to reflect multiple GPUs
-			existing.Name = fmt.Sprintf("%s GPUs (minimum %d)", capitalizeVendor(gpu.Vendor), existing.MinCount)
-		} else {
-			// Add new requirement
-			requirements = append(requirements, req)
 		}
 	}
 
-	// Add a general fallback requirement
-	requirements = append(requirements, GPURequirement{
-		Name:        "Any additional GPU (optional)",
-		MinPCILines: 4,
-		MinMemoryMB: 1024,
-		Driver:      "",
-		Vendor:      "any",
-		MinCount:    0,
-	})
+	// Create PCI to slot mapping
+	for i, gpu := range sortedGPUs {
+		logicalSlot := i + 1
+		pciToSlot[gpu.PCISlot] = logicalSlot
+		printInfo(fmt.Sprintf("  Mapping PCI %s -> Logical Slot %d (Physical: %s)",
+			gpu.PCISlot, logicalSlot, gpu.PhysicalSlot))
+	}
+
+	// Group devices by vendor and create requirements
+	vendorGroups := make(map[string][]GPUInfo)
+	for _, gpu := range gpus {
+		vendorGroups[gpu.Vendor] = append(vendorGroups[gpu.Vendor], gpu)
+	}
+
+	for vendor, gpusOfVendor := range vendorGroups {
+		printInfo(fmt.Sprintf("  Processing %d %s device(s):", len(gpusOfVendor), vendor))
+
+		var deviceIDs []string
+		minPCILines := 0
+		minMemoryMB := 0
+		driver := ""
+
+		for _, gpu := range gpusOfVendor {
+			printInfo(fmt.Sprintf("    - %s (Device ID: %s, PCI: %s, Physical: %s)",
+				gpu.Name, gpu.DeviceID, gpu.PCISlot, gpu.PhysicalSlot))
+			printInfo(fmt.Sprintf("      PCI Lines: %d, Memory: %d MB, Driver: %s",
+				gpu.PCILines, gpu.MemoryMB, gpu.Driver))
+
+			// Collect device IDs
+			if gpu.DeviceID != "" {
+				deviceIDs = append(deviceIDs, gpu.DeviceID)
+
+				// Generate visual representation for this specific device
+				visual := DeviceVisual{
+					Symbol:      generateSymbol(gpu),
+					ShortName:   generateShortName(gpu),
+					Description: gpu.Name,
+					Color:       generateColor(gpu.Name),
+				}
+
+				deviceMap[gpu.DeviceID] = visual
+				printInfo(fmt.Sprintf("      Added Device ID %s -> Symbol: %s, Short: %s, Color: %s",
+					gpu.DeviceID, visual.Symbol, visual.ShortName, visual.Color))
+			} else {
+				printWarning(fmt.Sprintf("      No Device ID found for device: %s", gpu.Name))
+			}
+
+			// Set minimum requirements based on detected values
+			if gpu.PCILines > minPCILines {
+				minPCILines = gpu.PCILines
+			}
+			if gpu.MemoryMB > minMemoryMB {
+				minMemoryMB = gpu.MemoryMB
+			}
+			if driver == "" && gpu.Driver != "unknown" {
+				driver = gpu.Driver
+			}
+		}
+
+		// Create requirement for this vendor group
+		req := GPURequirement{
+			Name:        fmt.Sprintf("%s devices (minimum %d)", capitalizeVendor(vendor), len(gpusOfVendor)),
+			Vendor:      vendor,
+			DeviceIDs:   deviceIDs,
+			MinCount:    len(gpusOfVendor),
+			MinPCILines: minPCILines,
+			MinMemoryMB: minMemoryMB,
+			Driver:      driver,
+		}
+
+		requirements = append(requirements, req)
+	}
+
+	// Check if device map is empty
+	if len(deviceMap) == 0 {
+		printWarning("No Device IDs were extracted from any devices!")
+		printWarning("This usually means lspci output format is unexpected.")
+		printWarning("Try running with -d flag for debug output to see parsing details.")
+		return fmt.Errorf("no device IDs found - cannot create meaningful configuration")
+	}
 
 	config := Config{
 		GPURequirements: requirements,
-		CheckPower:      true,
+		Visualization: VisualizationConfig{
+			DeviceMap:  deviceMap,
+			PCIToSlot:  pciToSlot,
+			TotalSlots: len(gpus) + 2, // Found GPUs + 2 extra slots
+			SlotWidth:  9,
+		},
+		CheckPower: true,
 	}
 
 	data, err := json.MarshalIndent(config, "", "  ")
@@ -224,37 +244,78 @@ func createDefaultConfig(configPath string) error {
 	}
 
 	printSuccess("Configuration created successfully based on detected hardware")
-	printInfo("You can edit the configuration file to adjust requirements as needed")
+	printInfo("All device mappings are based on real Device IDs found in your system")
+	printInfo(fmt.Sprintf("PCI to slot mapping created for %d device(s)", len(pciToSlot)))
+	printInfo(fmt.Sprintf("Total slots configured: %d", len(gpus)+2))
+	printInfo("You can edit the configuration file to adjust requirements and visuals as needed")
+	printInfo("  - Modify 'total_slots' to change number of displayed slots")
+	printInfo("  - Edit 'pci_to_slot' mapping to rearrange device positions")
 
 	return nil
 }
 
-func createMinimalConfig(configPath string) error {
-	defaultConfig := Config{
-		GPURequirements: []GPURequirement{
-			{
-				Name:        "Any GPU",
-				MinPCILines: 8,
-				MinMemoryMB: 2048,
-				Driver:      "",
-				Vendor:      "any",
-				MinCount:    1,
-			},
-		},
-		CheckPower: true,
+func generateSymbol(gpu GPUInfo) string {
+	// Generate symbol based on device type
+	nameLower := strings.ToLower(gpu.Name)
+
+	if strings.Contains(nameLower, "aspeed") || strings.Contains(nameLower, "bmc") {
+		return "▒▒▒" // BMC devices
+	} else if strings.Contains(nameLower, "network") || strings.Contains(nameLower, "ethernet") {
+		return "═══" // Network devices
+	} else if strings.Contains(nameLower, "storage") || strings.Contains(nameLower, "sata") || strings.Contains(nameLower, "nvme") {
+		return "███" // Storage devices
+	} else {
+		return "▓▓▓" // GPU and other graphics devices
+	}
+}
+
+func generateShortName(gpu GPUInfo) string {
+	// Extract first 3 characters after "VGA compatible controller:" or similar
+	name := gpu.Name
+
+	// Remove common prefixes
+	prefixes := []string{
+		"VGA compatible controller: ",
+		"3D controller: ",
+		"Display controller: ",
 	}
 
-	data, err := json.MarshalIndent(defaultConfig, "", "  ")
-	if err != nil {
-		return err
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(name, prefix) {
+			name = strings.TrimPrefix(name, prefix)
+			break
+		}
 	}
 
-	err = os.MkdirAll(filepath.Dir(configPath), 0755)
-	if err != nil {
-		return err
+	// Get first word and take first 3 characters
+	words := strings.Fields(name)
+	if len(words) > 0 {
+		firstWord := words[0]
+		if len(firstWord) >= 3 {
+			return strings.ToUpper(firstWord[:3])
+		} else {
+			return strings.ToUpper(firstWord)
+		}
 	}
 
-	return ioutil.WriteFile(configPath, data, 0644)
+	// Fallback to vendor short name
+	return shortenVendorName(gpu.Vendor)
+}
+
+func generateColor(name string) string {
+	// Generate color based on hash of name
+	colors := []string{"red", "green", "blue", "yellow", "cyan", "magenta", "white"}
+
+	// Simple hash function
+	hash := 0
+	for _, char := range name {
+		hash = hash*31 + int(char)
+	}
+	if hash < 0 {
+		hash = -hash
+	}
+
+	return colors[hash%len(colors)]
 }
 
 func capitalizeVendor(vendor string) string {
@@ -265,8 +326,34 @@ func capitalizeVendor(vendor string) string {
 		return "AMD"
 	case "intel":
 		return "Intel"
+	case "aspeed":
+		return "ASPEED"
 	default:
 		return strings.Title(vendor)
+	}
+}
+
+func shortenVendorName(vendor string) string {
+	switch strings.ToLower(vendor) {
+	case "nvidia":
+		return "NV"
+	case "intel":
+		return "INT"
+	case "amd":
+		return "AMD"
+	case "aspeed":
+		return "ASP"
+	case "mellanox":
+		return "MLX"
+	case "broadcom":
+		return "BCM"
+	case "unknown":
+		return "UNK"
+	default:
+		if len(vendor) > 3 {
+			return strings.ToUpper(vendor[:3])
+		}
+		return strings.ToUpper(vendor)
 	}
 }
 
@@ -380,6 +467,27 @@ func parseGPUBlock(lines []string) GPUInfo {
 		// Parse vendor and device ID from the name
 		gpu.Name = fullName
 		gpu.Vendor, gpu.DeviceID = parseVendorAndDeviceID(fullName)
+
+		if debugMode {
+			printDebug(fmt.Sprintf("Parsed first line: PCI=%s, Name=%s, Vendor=%s, DeviceID=%s",
+				gpu.PCISlot, gpu.Name, gpu.Vendor, gpu.DeviceID))
+		}
+	}
+
+	// If no device ID found yet, try to get it via lspci -n for this specific device
+	if gpu.DeviceID == "" && gpu.PCISlot != "" {
+		cmd := exec.Command("lspci", "-n", "-s", gpu.PCISlot)
+		if output, err := cmd.Output(); err == nil {
+			line := strings.TrimSpace(string(output))
+			// Format: 01:00.0 0300: 10de:1b06 (rev a1)
+			deviceRegex := regexp.MustCompile(`([0-9a-f]+:[0-9a-f]+\.[0-9a-f]+)\s+[0-9a-f]+:\s+([0-9a-f]+:[0-9a-f]+)`)
+			if matches := deviceRegex.FindStringSubmatch(line); len(matches) >= 3 {
+				gpu.DeviceID = matches[2]
+				if debugMode {
+					printDebug(fmt.Sprintf("Got Device ID from lspci -n: %s", gpu.DeviceID))
+				}
+			}
+		}
 	}
 
 	// Parse detailed information from subsequent lines
@@ -404,7 +512,7 @@ func parseGPUBlock(lines []string) GPUInfo {
 			}
 		}
 
-		// Parse PCI capabilities for ACTIVE lane information
+		// Parse PCI capabilities for ACTIVE lane information (LnkSta, not LnkCap)
 		if strings.Contains(line, "LnkSta:") {
 			gpu.PCILines = parsePCILanes(line)
 		}
@@ -449,6 +557,15 @@ func parseVendorAndDeviceID(name string) (vendor, deviceID string) {
 		deviceID = matches[1]
 	}
 
+	// If no device ID found in brackets, try to extract from other patterns
+	if deviceID == "" {
+		// Try to find vendor:device pattern without brackets
+		deviceRegex2 := regexp.MustCompile(`([0-9a-f]{4}):([0-9a-f]{4})`)
+		if matches := deviceRegex2.FindStringSubmatch(name); len(matches) >= 3 {
+			deviceID = matches[1] + ":" + matches[2]
+		}
+	}
+
 	// Determine vendor
 	if strings.Contains(nameLower, "nvidia") {
 		vendor = "nvidia"
@@ -456,6 +573,8 @@ func parseVendorAndDeviceID(name string) (vendor, deviceID string) {
 		vendor = "amd"
 	} else if strings.Contains(nameLower, "intel") {
 		vendor = "intel"
+	} else if strings.Contains(nameLower, "aspeed") {
+		vendor = "aspeed"
 	} else {
 		vendor = "unknown"
 	}
@@ -512,6 +631,337 @@ func parseMemoryRegion(line string) int {
 			return size / (1024 * 1024)
 		}
 		return 0
+	}
+}
+
+func centerText(text string, width int) string {
+	if len(text) == 0 {
+		return strings.Repeat(" ", width)
+	}
+
+	// Use runes to properly handle UTF-8
+	runes := []rune(text)
+	runeLen := len(runes)
+
+	if runeLen > width {
+		// Simple truncation without problematic characters
+		if width > 0 {
+			return string(runes[:width])
+		}
+		return ""
+	}
+
+	if runeLen == width {
+		return text
+	}
+
+	padding := width - runeLen
+	leftPad := padding / 2
+	rightPad := padding - leftPad
+
+	return strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)
+}
+
+func formatMemory(memoryMB int) string {
+	if memoryMB == 0 {
+		return "?"
+	}
+
+	if memoryMB < 1024 {
+		return fmt.Sprintf("%dMB", memoryMB)
+	} else if memoryMB < 1024*1024 {
+		gb := float64(memoryMB) / 1024.0
+		if gb == float64(int(gb)) {
+			return fmt.Sprintf("%dGB", int(gb))
+		} else {
+			return fmt.Sprintf("%.1fGB", gb)
+		}
+	} else {
+		tb := float64(memoryMB) / (1024.0 * 1024.0)
+		if tb == float64(int(tb)) {
+			return fmt.Sprintf("%dTB", int(tb))
+		} else {
+			return fmt.Sprintf("%.1fTB", tb)
+		}
+	}
+}
+
+func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
+	printInfo("PCIe Slots Layout:")
+	fmt.Println()
+
+	// Determine number of slots to show
+	maxSlots := config.TotalSlots
+	if maxSlots == 0 {
+		maxSlots = len(gpus) + 2 // Fallback if not configured
+	}
+
+	// Create slot data array indexed by logical slot number
+	slotData := make([]GPUInfo, maxSlots+1) // +1 because slots start from 1
+	physicalSlots := make([]string, maxSlots+1)
+	slotStatuses := make([]string, maxSlots+1) // "ok", "missing", "unexpected"
+
+	// Fill slots based on PCI to slot mapping
+	foundPCIs := make(map[string]bool)
+	for _, gpu := range gpus {
+		foundPCIs[gpu.PCISlot] = true
+		if logicalSlot, exists := config.PCIToSlot[gpu.PCISlot]; exists {
+			if logicalSlot > 0 && logicalSlot <= maxSlots {
+				slotData[logicalSlot] = gpu
+				physicalSlots[logicalSlot] = gpu.PhysicalSlot
+				slotStatuses[logicalSlot] = "ok"
+			}
+		}
+	}
+
+	// Check for missing devices
+	hasErrors := false
+	missingDevices := []string{}
+
+	for pciAddr, expectedSlot := range config.PCIToSlot {
+		if expectedSlot > 0 && expectedSlot <= maxSlots {
+			if !foundPCIs[pciAddr] {
+				// Device should be here but is missing
+				slotStatuses[expectedSlot] = "missing"
+				missingDevices = append(missingDevices, fmt.Sprintf("%s (slot %d)", pciAddr, expectedSlot))
+				hasErrors = true
+
+				// Create a placeholder for missing device
+				slotData[expectedSlot] = GPUInfo{
+					Name:    fmt.Sprintf("MISSING: %s", pciAddr),
+					PCISlot: pciAddr,
+				}
+			}
+		}
+	}
+
+	// Check for unexpected devices (found but not in mapping)
+	unexpectedDevices := []string{}
+	for _, gpu := range gpus {
+		if _, exists := config.PCIToSlot[gpu.PCISlot]; !exists {
+			unexpectedDevices = append(unexpectedDevices, gpu.PCISlot)
+			hasErrors = true
+		}
+	}
+
+	// Build visualization rows
+	width := config.SlotWidth
+
+	// Top border
+	fmt.Print("┌")
+	for i := 1; i <= maxSlots; i++ {
+		fmt.Print(strings.Repeat("─", width))
+		if i < maxSlots {
+			fmt.Print("┬")
+		}
+	}
+	fmt.Println("┐")
+
+	// Symbols row with color coding
+	fmt.Print("│")
+	for i := 1; i <= maxSlots; i++ {
+		visual := getDeviceVisual(slotData[i], config)
+		status := slotStatuses[i]
+
+		symbolText := centerText(visual.Symbol, width)
+		if status == "ok" {
+			fmt.Print(ColorGreen + symbolText + ColorReset)
+		} else if status == "missing" {
+			fmt.Print(ColorRed + centerText("░░░", width) + ColorReset)
+		} else {
+			fmt.Print(symbolText) // Empty slot
+		}
+		fmt.Print("│")
+	}
+	fmt.Println()
+
+	// Short names row with color coding
+	fmt.Print("│")
+	for i := 1; i <= maxSlots; i++ {
+		status := slotStatuses[i]
+
+		if slotData[i].Name != "" {
+			visual := getDeviceVisual(slotData[i], config)
+			nameText := centerText(visual.ShortName, width)
+
+			if status == "ok" {
+				fmt.Print(ColorGreen + nameText + ColorReset)
+			} else if status == "missing" {
+				fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
+			} else {
+				fmt.Print(nameText)
+			}
+		} else {
+			fmt.Print(strings.Repeat(" ", width))
+		}
+		fmt.Print("│")
+	}
+	fmt.Println()
+
+	// PCI lanes row
+	fmt.Print("│")
+	for i := 1; i <= maxSlots; i++ {
+		status := slotStatuses[i]
+
+		if slotData[i].Name != "" {
+			var pciInfo string
+			if status == "missing" {
+				pciInfo = "?"
+			} else {
+				if slotData[i].PCILines > 0 {
+					pciInfo = fmt.Sprintf("x%d", slotData[i].PCILines)
+				} else {
+					pciInfo = "x?"
+				}
+			}
+
+			pciText := centerText(pciInfo, width)
+			if status == "ok" {
+				fmt.Print(ColorGreen + pciText + ColorReset)
+			} else if status == "missing" {
+				fmt.Print(ColorRed + pciText + ColorReset)
+			} else {
+				fmt.Print(pciText)
+			}
+		} else {
+			fmt.Print(strings.Repeat(" ", width))
+		}
+		fmt.Print("│")
+	}
+	fmt.Println()
+
+	// Memory row
+	fmt.Print("│")
+	for i := 1; i <= maxSlots; i++ {
+		status := slotStatuses[i]
+
+		if slotData[i].Name != "" {
+			var memInfo string
+			if status == "missing" {
+				memInfo = "?"
+			} else {
+				memInfo = formatMemory(slotData[i].MemoryMB)
+			}
+
+			memText := centerText(memInfo, width)
+			if status == "ok" {
+				fmt.Print(ColorGreen + memText + ColorReset)
+			} else if status == "missing" {
+				fmt.Print(ColorRed + memText + ColorReset)
+			} else {
+				fmt.Print(memText)
+			}
+		} else {
+			fmt.Print(strings.Repeat(" ", width))
+		}
+		fmt.Print("│")
+	}
+	fmt.Println()
+
+	// Bottom border
+	fmt.Print("└")
+	for i := 1; i <= maxSlots; i++ {
+		fmt.Print(strings.Repeat("─", width))
+		if i < maxSlots {
+			fmt.Print("┴")
+		}
+	}
+	fmt.Println("┘")
+
+	// Logical slot numbers
+	fmt.Print(" ")
+	for i := 1; i <= maxSlots; i++ {
+		fmt.Print(centerText(fmt.Sprintf("%d", i), width+1))
+	}
+	fmt.Println("(Logic)")
+
+	// Physical slot numbers
+	fmt.Print(" ")
+	for i := 1; i <= maxSlots; i++ {
+		physSlot := physicalSlots[i]
+		if physSlot == "" || physSlot == "unknown" {
+			physSlot = "-"
+		}
+		fmt.Print(centerText(physSlot, width+1))
+	}
+	fmt.Println("(Physical)")
+
+	// PCI addresses row
+	fmt.Print(" ")
+	for i := 1; i <= maxSlots; i++ {
+		pciAddr := ""
+		if slotData[i].Name != "" {
+			pciAddr = slotData[i].PCISlot
+		} else {
+			pciAddr = "-"
+		}
+		fmt.Print(centerText(pciAddr, width+1))
+	}
+	fmt.Println("(PCI)")
+
+	fmt.Println()
+
+	// Print legend
+	printInfo("Legend:")
+	fmt.Printf("  %s%s%s Present & OK  ", ColorGreen, "▓▓▓", ColorReset)
+	fmt.Printf("  %s%s%s Missing Device  ", ColorRed, "░░░", ColorReset)
+	fmt.Printf("  %s%s%s Empty Slot\n", ColorWhite, "░░░", ColorReset)
+
+	// Report issues
+	if len(missingDevices) > 0 {
+		fmt.Println()
+		printError("Missing devices:")
+		for _, device := range missingDevices {
+			printError(fmt.Sprintf("  - %s", device))
+		}
+	}
+
+	if len(unexpectedDevices) > 0 {
+		fmt.Println()
+		printWarning("Unexpected devices (not in configuration mapping):")
+		for _, pci := range unexpectedDevices {
+			printWarning(fmt.Sprintf("  - %s", pci))
+		}
+	}
+
+	if hasErrors {
+		fmt.Println()
+		printError("Configuration validation FAILED!")
+		printInfo("Update your configuration file to fix PCI to slot mappings:")
+		printInfo("  - Add missing devices to 'pci_to_slot' mapping")
+		printInfo("  - Remove mappings for devices that are no longer present")
+		return fmt.Errorf("GPU configuration validation failed")
+	} else {
+		fmt.Println()
+		printSuccess("All devices present and accounted for!")
+		return nil
+	}
+}
+
+func getDeviceVisual(gpu GPUInfo, config *VisualizationConfig) DeviceVisual {
+	// If GPU is empty (name is empty), return empty slot
+	if gpu.Name == "" {
+		return DeviceVisual{
+			Symbol:      "░░░",
+			ShortName:   "",
+			Description: "Empty Slot",
+			Color:       "gray",
+		}
+	}
+
+	// Check if we have specific mapping for this device ID
+	if gpu.DeviceID != "" {
+		if visual, exists := config.DeviceMap[gpu.DeviceID]; exists {
+			return visual
+		}
+	}
+
+	// Generate fallback visual for unknown devices
+	return DeviceVisual{
+		Symbol:      generateSymbol(gpu),
+		ShortName:   generateShortName(gpu),
+		Description: gpu.Name,
+		Color:       generateColor(gpu.Name),
 	}
 }
 
@@ -626,9 +1076,23 @@ func filterGPUs(gpus []GPUInfo, req GPURequirement) []GPUInfo {
 	var matching []GPUInfo
 
 	for _, gpu := range gpus {
-		// Check vendor filter
-		if req.Vendor != "" && req.Vendor != "any" && gpu.Vendor != req.Vendor {
-			continue
+		// Check specific device IDs first (most precise)
+		if len(req.DeviceIDs) > 0 {
+			found := false
+			for _, deviceID := range req.DeviceIDs {
+				if gpu.DeviceID == deviceID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		} else {
+			// Check vendor filter if no specific device IDs
+			if req.Vendor != "" && req.Vendor != "any" && gpu.Vendor != req.Vendor {
+				continue
+			}
 		}
 
 		matching = append(matching, gpu)
@@ -644,6 +1108,7 @@ func main() {
 		createConfig = flag.Bool("s", false, "Create default configuration file")
 		showHelpFlag = flag.Bool("h", false, "Show help")
 		listOnly     = flag.Bool("l", false, "List detected GPUs without configuration check")
+		visualize    = flag.Bool("vis", false, "Show visual PCIe slots layout")
 		debugFlag    = flag.Bool("d", false, "Show detailed debug information")
 	)
 
@@ -685,6 +1150,39 @@ func main() {
 				fmt.Printf("  Memory: %d MB\n", gpu.MemoryMB)
 			}
 		}
+		return
+	}
+
+	if *visualize {
+		printInfo("Scanning for GPU devices...")
+		gpus, err := getGPUInfo()
+		if err != nil {
+			printError(fmt.Sprintf("Error getting GPU information: %v", err))
+			os.Exit(1)
+		}
+
+		// Load configuration for visualization settings
+		config, err := loadConfig(*configPath)
+		var visConfig *VisualizationConfig
+		if err != nil {
+			printWarning("Could not load configuration, using defaults for visualization")
+			// Use minimal visualization config - create simple mapping
+			visConfig = &VisualizationConfig{
+				DeviceMap:  make(map[string]DeviceVisual),
+				PCIToSlot:  make(map[string]int),
+				TotalSlots: len(gpus) + 2,
+				SlotWidth:  9,
+			}
+
+			// Create simple PCI to slot mapping for visualization
+			for i, gpu := range gpus {
+				visConfig.PCIToSlot[gpu.PCISlot] = i + 1
+			}
+		} else {
+			visConfig = &config.Visualization
+		}
+
+		visualizeSlots(gpus, visConfig)
 		return
 	}
 
