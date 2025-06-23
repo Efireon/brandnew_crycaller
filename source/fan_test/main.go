@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bougou/go-ipmi"
@@ -136,9 +135,18 @@ func getFanInfo() ([]FanInfo, error) {
 	ch := make(chan result, 3)
 
 	// Launch parallel detection methods
-	go func() { fans, err := getFanInfoFromSensors(); ch <- result{fans, err} }()
-	go func() { fans, err := getFanInfoFromHwmon(); ch <- result{fans, err} }()
-	go func() { fans, err := getFanInfoFromIPMI(); ch <- result{fans, err} }()
+	go func() {
+		fans, err := getFanInfoFromSensors()
+		ch <- result{fans, err}
+	}()
+	go func() {
+		fans, err := getFanInfoFromHwmon()
+		ch <- result{fans, err}
+	}()
+	go func() {
+		fans, err := getFanInfoFromIPMI()
+		ch <- result{fans, err}
+	}()
 
 	var errs []error
 	for i := 0; i < 3; i++ {
@@ -151,14 +159,15 @@ func getFanInfo() ([]FanInfo, error) {
 		}
 	}
 
-	var sb strings.Builder
-	sb.WriteString("no fans found using any detection method:")
+	// None found: aggregate errors
+	var errMsg strings.Builder
+	errMsg.WriteString("no fans found using any detection method:")
 	for _, e := range errs {
-		sb.WriteString(" ")
-		sb.WriteString(e.Error())
-		sb.WriteString(";")
+		errMsg.WriteString(" ")
+		errMsg.WriteString(e.Error())
+		errMsg.WriteString(";")
 	}
-	return nil, fmt.Errorf("%s", sb.String())
+	return nil, fmt.Errorf(errMsg.String())
 }
 
 func getFanInfoFromSensors() ([]FanInfo, error) {
@@ -283,6 +292,22 @@ func getFanInfoFromHwmon() ([]FanInfo, error) {
 }
 
 func getFanInfoFromIPMI() ([]FanInfo, error) {
+	// Пробуем сначала go-ipmi библиотеку
+	fans, err := getFanInfoFromGoIPMI()
+	if err == nil && len(fans) > 0 {
+		return fans, nil
+	}
+
+	if debugMode {
+		printDebug(fmt.Sprintf("go-ipmi failed: %v, falling back to ipmitool", err))
+	}
+
+	// Fallback к старому методу через exec ipmitool
+	return getFanInfoFromIPMITool()
+}
+
+func getFanInfoFromGoIPMI() ([]FanInfo, error) {
+	// 1) Создаём и подсоединяем IPMI-клиент
 	client, err := ipmi.NewOpenClient()
 	if err != nil {
 		return nil, fmt.Errorf("new IPMI client: %v", err)
@@ -294,6 +319,7 @@ func getFanInfoFromIPMI() ([]FanInfo, error) {
 	}
 	defer client.Close(ctx)
 
+	// 2) Считываем все SDR-записи Full и Compact
 	sdrs, err := client.GetSDRs(ctx,
 		ipmi.SDRRecordTypeFullSensor,
 		ipmi.SDRRecordTypeCompactSensor,
@@ -302,62 +328,66 @@ func getFanInfoFromIPMI() ([]FanInfo, error) {
 		return nil, fmt.Errorf("GetSDRs failed: %w", err)
 	}
 
-	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		fans     []FanInfo
-		firstErr error
-	)
+	var fans []FanInfo
 
-	// Iterate SDRs and fire goroutine per fan
+	// 3) Фильтруем только Fan SDR
 	for _, sdr := range sdrs {
-		// Only FullSensor records can be analog fans
-		if sdr.Full == nil {
-			continue
-		}
-		// Must have analog reading and be a FAN type
-		if !sdr.HasAnalogReading() || sdr.Full.SensorType != ipmi.SensorTypeFan {
+		full := sdr.Full
+		if full == nil || full.SensorType != ipmi.SensorTypeFan {
 			continue
 		}
 
-		name := sdr.SensorName()
-		num := uint8(sdr.SensorNumber())
+		// 4) Получаем имя и номер сенсора
+		name := sdr.SensorName()  // метод SDR.SensorName()
+		num := sdr.SensorNumber() // метод SDR.SensorNumber() → SensorNumber (alias uint8)
 
-		wg.Add(1)
-		go func(name string, num uint8) {
-			defer wg.Done()
-			resp, err := client.GetSensorByID(ctx, num)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
+		// 5) Читаем фактический Sensor (Value + Status + пороги)
+		resp, err := client.GetSensorByID(ctx, uint8(num))
+		if err != nil {
+			if debugMode {
+				printDebug(fmt.Sprintf("IPMI read %q failed: %v", name, err))
 			}
-			mu.Lock()
-			fans = append(fans, FanInfo{
-				Name:       name,
-				Position:   normalizeIPMIFanPosition(name),
-				CurrentRPM: int(resp.Value),
-				Status:     resp.Status(),
-				Sensor:     "IPMI",
-				FanType:    determineIPMIFanType(name),
-				MinRPM:     int(resp.Threshold.LNC),
-				MaxRPM:     int(resp.Threshold.UNC),
-			})
-			mu.Unlock()
-		}(name, num)
+			continue
+		}
+
+		// 6) Собираем FanInfo из данных Sensor
+		fan := FanInfo{
+			Name:       name,
+			Position:   normalizeIPMIFanPosition(name),
+			CurrentRPM: int(resp.Value), // поле Sensor.Value
+			Status:     resp.Status(),   // метод Sensor.Status()
+			Sensor:     "IPMI",
+			FanType:    determineIPMIFanType(name),
+			MinRPM:     int(resp.Threshold.LNC), // Lower Non-Critical
+			MaxRPM:     int(resp.Threshold.UNC), // Upper Non-Critical
+		}
+		fans = append(fans, fan)
 	}
 
-	wg.Wait()
-	if len(fans) == 0 {
-		if firstErr != nil {
-			return nil, fmt.Errorf("no fans found via IPMI: %v", firstErr)
-		}
-		return nil, fmt.Errorf("no fan sensors detected via IPMI")
-	}
+	// 7) Возвращаем результат
 	return fans, nil
+}
+
+func getFanInfoFromIPMITool() ([]FanInfo, error) {
+	// Check if ipmitool command exists
+	if _, err := exec.LookPath("ipmitool"); err != nil {
+		return nil, fmt.Errorf("ipmitool command not found")
+	}
+
+	// Run ipmitool to get sensor information
+	cmd := exec.Command("ipmitool", "sensor", "list")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run ipmitool sensor list: %v", err)
+	}
+
+	outputStr := string(output)
+	if debugMode {
+		printDebug("ipmitool sensor list output:")
+		printDebug(outputStr)
+	}
+
+	return parseIPMIOutput(outputStr), nil
 }
 
 // === PARSING FUNCTIONS ===
@@ -454,6 +484,77 @@ func parseFanLine(line, chipName string) FanInfo {
 		fan.Status = "ALARM"
 	} else {
 		fan.Status = "OK"
+	}
+
+	return fan
+}
+
+func parseIPMIOutput(output string) []FanInfo {
+	var fans []FanInfo
+
+	lines := strings.Split(output, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if strings.Contains(strings.ToUpper(line), "FAN") && strings.Contains(strings.ToUpper(line), "RPM") {
+			fan := parseIPMIFanLine(line)
+			if fan.Name != "" {
+				fans = append(fans, fan)
+			}
+		}
+	}
+
+	return fans
+}
+
+func parseIPMIFanLine(line string) FanInfo {
+	var fan FanInfo
+	fan.Sensor = "IPMI"
+
+	// Split by | and trim spaces
+	parts := strings.Split(line, "|")
+	if len(parts) < 4 {
+		return fan
+	}
+
+	fanName := strings.TrimSpace(parts[0])
+	rpmValue := strings.TrimSpace(parts[1])
+	unit := strings.TrimSpace(parts[2])
+	status := strings.TrimSpace(parts[3])
+
+	// Verify this is a fan with RPM unit
+	if !strings.Contains(strings.ToUpper(unit), "RPM") {
+		return fan
+	}
+
+	fan.Name = fanName
+	fan.Position = normalizeIPMIFanPosition(fanName)
+	fan.FanType = determineIPMIFanType(fanName)
+
+	// Parse status first - if N/A, this is physically absent fan
+	switch strings.ToLower(status) {
+	case "ok":
+		fan.Status = "OK"
+	case "nc", "na":
+		fan.Status = "N/A"
+		return fan // Don't parse RPM for N/A fans
+	case "cr", "critical":
+		fan.Status = "FAIL"
+	case "nr", "non-recoverable":
+		fan.Status = "FAIL"
+	default:
+		fan.Status = strings.ToUpper(status)
+	}
+
+	// Parse RPM value only if fan is present
+	if rpmValue != "na" && rpmValue != "" {
+		if rpmFloat, err := strconv.ParseFloat(rpmValue, 64); err == nil {
+			fan.CurrentRPM = int(rpmFloat)
+		}
 	}
 
 	return fan
