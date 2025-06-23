@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,7 +15,7 @@ import (
 	"github.com/bougou/go-ipmi"
 )
 
-const VERSION = "2.0.0"
+const VERSION = "2.0.1"
 
 type FanInfo struct {
 	Name         string  `json:"name"`
@@ -780,7 +779,7 @@ func createDefaultConfig(configPath string) error {
 		return err
 	}
 
-	err = ioutil.WriteFile(configPath, data, 0644)
+	err = os.WriteFile(configPath, data, 0644)
 	if err != nil {
 		return err
 	}
@@ -801,7 +800,7 @@ func createDefaultConfig(configPath string) error {
 }
 
 func loadConfig(configPath string) (*Config, error) {
-	data, err := ioutil.ReadFile(configPath)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
 	}

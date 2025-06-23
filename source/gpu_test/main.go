@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 	"strings"
 )
 
-const VERSION = "2.0.0"
+const VERSION = "2.0.1"
 
 type GPUInfo struct {
 	Name         string `json:"name"`
@@ -255,7 +254,7 @@ func createDefaultConfig(configPath string) error {
 		return err
 	}
 
-	err = ioutil.WriteFile(configPath, data, 0644)
+	err = os.WriteFile(configPath, data, 0644)
 	if err != nil {
 		return err
 	}
