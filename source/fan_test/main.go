@@ -78,7 +78,7 @@ type FanCheckResult struct {
 // ANSI color codes
 const (
 	ColorReset  = "\033[0m"
-	ColorGreen  = "\033[32m"
+	ColorGreen  = "\033[92m"
 	ColorBlue   = "\033[34m"
 	ColorWhite  = "\033[37m"
 	ColorYellow = "\033[33m"
@@ -1286,9 +1286,9 @@ func renderSingleRowVisualization(slotData []FanInfo, slotResults []FanCheckResu
 			switch result.Status {
 			case "ok":
 				fmt.Print(ColorGreen + symbolText + ColorReset)
-			case "warning", "error":
+			case "warning":
 				fmt.Print(ColorYellow + symbolText + ColorReset)
-			case "missing":
+			case "missing", "error":
 				fmt.Print(ColorRed + centerText("░░░", width) + ColorReset)
 			default:
 				fmt.Print(symbolText)
@@ -1314,9 +1314,9 @@ func renderSingleRowVisualization(slotData []FanInfo, slotResults []FanCheckResu
 				switch result.Status {
 				case "ok":
 					fmt.Print(ColorGreen + nameText + ColorReset)
-				case "warning", "error":
+				case "warning":
 					fmt.Print(ColorYellow + nameText + ColorReset)
-				case "missing":
+				case "missing", "error":
 					fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
 				default:
 					fmt.Print(nameText)
@@ -1347,13 +1347,13 @@ func renderSingleRowVisualization(slotData []FanInfo, slotResults []FanCheckResu
 
 			rpmText := centerText(rpmInfo, width)
 
-			if result.Status == "missing" {
+			if result.Status == "missing" || result.Status == "error" {
 				fmt.Print(ColorRed + rpmText + ColorReset)
 			} else if expectedStatus == "N/A" && slotData[i].Status == "N/A" {
 				fmt.Print(ColorGreen + rpmText + ColorReset)
 			} else if !result.RPMOK {
 				fmt.Print(ColorRed + rpmText + ColorReset)
-			} else if result.Status == "warning" || result.Status == "error" {
+			} else if result.Status == "warning" {
 				fmt.Print(ColorYellow + rpmText + ColorReset)
 			} else if result.Status == "ok" {
 				fmt.Print(ColorGreen + rpmText + ColorReset)
@@ -1383,13 +1383,13 @@ func renderSingleRowVisualization(slotData []FanInfo, slotResults []FanCheckResu
 
 			statusText := centerText(statusInfo, width)
 
-			if result.Status == "missing" {
+			if result.Status == "missing" || result.Status == "error" {
 				fmt.Print(ColorRed + statusText + ColorReset)
 			} else if expectedStatus == "N/A" && slotData[i].Status == "N/A" {
 				fmt.Print(ColorGreen + statusText + ColorReset)
 			} else if !result.StatusOK {
 				fmt.Print(ColorRed + statusText + ColorReset)
-			} else if result.Status == "warning" || result.Status == "error" {
+			} else if result.Status == "warning" {
 				fmt.Print(ColorYellow + statusText + ColorReset)
 			} else if result.Status == "ok" {
 				fmt.Print(ColorGreen + statusText + ColorReset)
@@ -1494,9 +1494,9 @@ func renderMultiRowVisualization(slotData []FanInfo, slotResults []FanCheckResul
 				switch result.Status {
 				case "ok":
 					fmt.Print(ColorGreen + symbolText + ColorReset)
-				case "warning", "error":
+				case "warning":
 					fmt.Print(ColorYellow + symbolText + ColorReset)
-				case "missing":
+				case "missing", "error":
 					fmt.Print(ColorRed + centerText("░░░", width) + ColorReset)
 				default:
 					fmt.Print(symbolText)
@@ -1523,9 +1523,9 @@ func renderMultiRowVisualization(slotData []FanInfo, slotResults []FanCheckResul
 					switch result.Status {
 					case "ok":
 						fmt.Print(ColorGreen + nameText + ColorReset)
-					case "warning", "error":
+					case "warning":
 						fmt.Print(ColorYellow + nameText + ColorReset)
-					case "missing":
+					case "missing", "error":
 						fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
 					default:
 						fmt.Print(nameText)
@@ -1557,13 +1557,13 @@ func renderMultiRowVisualization(slotData []FanInfo, slotResults []FanCheckResul
 
 				rpmText := centerText(rpmInfo, width)
 
-				if result.Status == "missing" {
+				if result.Status == "missing" || result.Status == "error" {
 					fmt.Print(ColorRed + rpmText + ColorReset)
 				} else if expectedStatus == "N/A" && slotData[slotIdx].Status == "N/A" {
 					fmt.Print(ColorGreen + rpmText + ColorReset)
 				} else if !result.RPMOK {
 					fmt.Print(ColorRed + rpmText + ColorReset)
-				} else if result.Status == "warning" || result.Status == "error" {
+				} else if result.Status == "warning" {
 					fmt.Print(ColorYellow + rpmText + ColorReset)
 				} else if result.Status == "ok" {
 					fmt.Print(ColorGreen + rpmText + ColorReset)
