@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const VERSION = "1.0.0"
+const VERSION = "2.0.0"
 
 type GPUInfo struct {
 	Name         string `json:"name"`
@@ -34,6 +34,18 @@ type GPURequirement struct {
 	Vendor      string   `json:"vendor"`
 	DeviceIDs   []string `json:"device_ids,omitempty"`
 	MinCount    int      `json:"min_count"`
+}
+
+// Структура для детальной информации о проверке GPU
+type GPUCheckResult struct {
+	Status       string // "ok", "warning", "error"
+	Issues       []string
+	PCILinesOK   bool
+	MemoryOK     bool
+	DriverOK     bool
+	PCILinesWarn bool
+	MemoryWarn   bool
+	DriverWarn   bool
 }
 
 type DeviceVisual struct {
@@ -686,12 +698,102 @@ func formatMemory(memoryMB int) string {
 	}
 }
 
-func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
+// Новая функция для проверки GPU против требований
+func checkGPUAgainstRequirements(gpu GPUInfo, requirements []GPURequirement) GPUCheckResult {
+	result := GPUCheckResult{
+		Status:     "ok",
+		PCILinesOK: true,
+		MemoryOK:   true,
+		DriverOK:   true,
+	}
+
+	// Find matching requirements for this GPU
+	var matchingReqs []GPURequirement
+
+	for _, req := range requirements {
+		// Check if this GPU matches the requirement
+		if len(req.DeviceIDs) > 0 {
+			// Check specific device IDs
+			for _, deviceID := range req.DeviceIDs {
+				if gpu.DeviceID == deviceID {
+					matchingReqs = append(matchingReqs, req)
+					break
+				}
+			}
+		} else if req.Vendor != "" && req.Vendor != "any" {
+			// Check vendor
+			if gpu.Vendor == req.Vendor {
+				matchingReqs = append(matchingReqs, req)
+			}
+		}
+	}
+
+	if len(matchingReqs) == 0 {
+		// No requirements found for this GPU - not necessarily an error
+		return result
+	}
+
+	hasErrors := false
+	hasWarnings := false
+
+	// Check against all matching requirements
+	for _, req := range matchingReqs {
+		// Check PCI lanes
+		if req.MinPCILines > 0 {
+			if gpu.PCILines == 0 {
+				result.Issues = append(result.Issues, "Could not determine active PCI lanes")
+				result.PCILinesWarn = true
+				hasWarnings = true
+			} else if gpu.PCILines < req.MinPCILines {
+				result.Issues = append(result.Issues, fmt.Sprintf("PCI lanes: %d active (required %d)", gpu.PCILines, req.MinPCILines))
+				result.PCILinesOK = false
+				hasErrors = true
+			}
+		}
+
+		// Check memory
+		if req.MinMemoryMB > 0 {
+			if gpu.MemoryMB == 0 {
+				result.Issues = append(result.Issues, "Could not determine memory size")
+				result.MemoryWarn = true
+				hasWarnings = true
+			} else if gpu.MemoryMB < req.MinMemoryMB {
+				result.Issues = append(result.Issues, fmt.Sprintf("Memory: %d MB (required %d MB)", gpu.MemoryMB, req.MinMemoryMB))
+				result.MemoryOK = false
+				hasErrors = true
+			}
+		}
+
+		// Check driver
+		if req.Driver != "" {
+			if gpu.Driver == "unknown" {
+				result.Issues = append(result.Issues, "Could not determine driver")
+				result.DriverWarn = true
+				hasWarnings = true
+			} else if gpu.Driver != req.Driver {
+				result.Issues = append(result.Issues, fmt.Sprintf("Driver: %s (required %s)", gpu.Driver, req.Driver))
+				result.DriverOK = false
+				hasErrors = true
+			}
+		}
+	}
+
+	if hasErrors {
+		result.Status = "error"
+	} else if hasWarnings {
+		result.Status = "warning"
+	}
+
+	return result
+}
+
+// Обновленная функция visualizeSlots с проверкой требований
+func visualizeSlots(gpus []GPUInfo, config *Config) error {
 	printInfo("PCIe Slots Layout:")
 	fmt.Println()
 
 	// Determine number of slots to show
-	maxSlots := config.TotalSlots
+	maxSlots := config.Visualization.TotalSlots
 	if maxSlots == 0 {
 		maxSlots = len(gpus) + 2 // Fallback if not configured
 	}
@@ -699,30 +801,33 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	// Create slot data array indexed by logical slot number
 	slotData := make([]GPUInfo, maxSlots+1) // +1 because slots start from 1
 	physicalSlots := make([]string, maxSlots+1)
-	slotStatuses := make([]string, maxSlots+1) // "ok", "missing", "unexpected"
+	slotResults := make([]GPUCheckResult, maxSlots+1) // Check results for each slot
 
 	// Fill slots based on PCI to slot mapping
 	foundPCIs := make(map[string]bool)
 	for _, gpu := range gpus {
 		foundPCIs[gpu.PCISlot] = true
-		if logicalSlot, exists := config.PCIToSlot[gpu.PCISlot]; exists {
+		if logicalSlot, exists := config.Visualization.PCIToSlot[gpu.PCISlot]; exists {
 			if logicalSlot > 0 && logicalSlot <= maxSlots {
 				slotData[logicalSlot] = gpu
 				physicalSlots[logicalSlot] = gpu.PhysicalSlot
-				slotStatuses[logicalSlot] = "ok"
+
+				// Check this GPU against requirements
+				slotResults[logicalSlot] = checkGPUAgainstRequirements(gpu, config.GPURequirements)
 			}
 		}
 	}
 
 	// Check for missing devices
 	hasErrors := false
+	hasWarnings := false
 	missingDevices := []string{}
 
-	for pciAddr, expectedSlot := range config.PCIToSlot {
+	for pciAddr, expectedSlot := range config.Visualization.PCIToSlot {
 		if expectedSlot > 0 && expectedSlot <= maxSlots {
 			if !foundPCIs[pciAddr] {
 				// Device should be here but is missing
-				slotStatuses[expectedSlot] = "missing"
+				slotResults[expectedSlot] = GPUCheckResult{Status: "missing"}
 				missingDevices = append(missingDevices, fmt.Sprintf("%s (slot %d)", pciAddr, expectedSlot))
 				hasErrors = true
 
@@ -738,14 +843,75 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	// Check for unexpected devices (found but not in mapping)
 	unexpectedDevices := []string{}
 	for _, gpu := range gpus {
-		if _, exists := config.PCIToSlot[gpu.PCISlot]; !exists {
+		if _, exists := config.Visualization.PCIToSlot[gpu.PCISlot]; !exists {
 			unexpectedDevices = append(unexpectedDevices, gpu.PCISlot)
-			hasErrors = true
+			hasWarnings = true
 		}
 	}
 
+	// Count status types for summary
+	for i := 1; i <= maxSlots; i++ {
+		status := slotResults[i].Status
+		if status == "error" || status == "missing" {
+			hasErrors = true
+		} else if status == "warning" {
+			hasWarnings = true
+		}
+	}
+
+	// Print legend BEFORE the table
+	printInfo("Legend:")
+	fmt.Printf("  %s%s%s Present & OK  ", ColorGreen, "▓▓▓", ColorReset)
+	fmt.Printf("  %s%s%s Device with Issues  ", ColorYellow, "▓▓▓", ColorReset)
+	fmt.Printf("  %s%s%s Missing Device  ", ColorRed, "░░░", ColorReset)
+	fmt.Printf("  %s%s%s Empty Slot\n", ColorWhite, "░░░", ColorReset)
+	fmt.Println()
+
+	// Report missing devices BEFORE the table
+	if len(missingDevices) > 0 {
+		printError("Missing devices:")
+		for _, device := range missingDevices {
+			printError(fmt.Sprintf("  - %s", device))
+		}
+		fmt.Println()
+	}
+
+	if len(unexpectedDevices) > 0 {
+		printWarning("Unexpected devices (not in configuration mapping):")
+		for _, pci := range unexpectedDevices {
+			printWarning(fmt.Sprintf("  - %s", pci))
+		}
+		fmt.Println()
+	}
+
+	// Report detailed issues for each slot
+	for i := 1; i <= maxSlots; i++ {
+		result := slotResults[i]
+		if len(result.Issues) > 0 {
+			gpu := slotData[i]
+
+			if result.Status == "error" {
+				printError(fmt.Sprintf("Slot %d (%s) issues:", i, gpu.PCISlot))
+			} else if result.Status == "warning" {
+				printWarning(fmt.Sprintf("Slot %d (%s) warnings:", i, gpu.PCISlot))
+			}
+
+			for _, issue := range result.Issues {
+				if result.Status == "error" {
+					printError(fmt.Sprintf("  - %s", issue))
+				} else if result.Status == "warning" {
+					printWarning(fmt.Sprintf("  - %s", issue))
+				}
+			}
+		}
+	}
+
+	if hasErrors || hasWarnings {
+		fmt.Println()
+	}
+
 	// Build visualization rows
-	width := config.SlotWidth
+	width := config.Visualization.SlotWidth
 
 	// Top border
 	fmt.Print("┌")
@@ -757,18 +923,22 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	}
 	fmt.Println("┐")
 
-	// Symbols row with color coding
+	// Symbols row with color coding based on status
 	fmt.Print("│")
 	for i := 1; i <= maxSlots; i++ {
-		visual := getDeviceVisual(slotData[i], config)
-		status := slotStatuses[i]
+		visual := getDeviceVisual(slotData[i], &config.Visualization)
+		result := slotResults[i]
 
 		symbolText := centerText(visual.Symbol, width)
-		if status == "ok" {
+
+		switch result.Status {
+		case "ok":
 			fmt.Print(ColorGreen + symbolText + ColorReset)
-		} else if status == "missing" {
+		case "warning", "error":
+			fmt.Print(ColorYellow + symbolText + ColorReset) // Слот желтый при проблемах
+		case "missing":
 			fmt.Print(ColorRed + centerText("░░░", width) + ColorReset)
-		} else {
+		default:
 			fmt.Print(symbolText) // Empty slot
 		}
 		fmt.Print("│")
@@ -778,17 +948,20 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	// Short names row with color coding
 	fmt.Print("│")
 	for i := 1; i <= maxSlots; i++ {
-		status := slotStatuses[i]
+		result := slotResults[i]
 
 		if slotData[i].Name != "" {
-			visual := getDeviceVisual(slotData[i], config)
+			visual := getDeviceVisual(slotData[i], &config.Visualization)
 			nameText := centerText(visual.ShortName, width)
 
-			if status == "ok" {
+			switch result.Status {
+			case "ok":
 				fmt.Print(ColorGreen + nameText + ColorReset)
-			} else if status == "missing" {
+			case "warning", "error":
+				fmt.Print(ColorYellow + nameText + ColorReset) // Слот желтый при проблемах
+			case "missing":
 				fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
-			} else {
+			default:
 				fmt.Print(nameText)
 			}
 		} else {
@@ -798,14 +971,14 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	}
 	fmt.Println()
 
-	// PCI lanes row
+	// PCI lanes row with specific color coding for values
 	fmt.Print("│")
 	for i := 1; i <= maxSlots; i++ {
-		status := slotStatuses[i]
+		result := slotResults[i]
 
 		if slotData[i].Name != "" {
 			var pciInfo string
-			if status == "missing" {
+			if result.Status == "missing" {
 				pciInfo = "?"
 			} else {
 				if slotData[i].PCILines > 0 {
@@ -816,10 +989,17 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 			}
 
 			pciText := centerText(pciInfo, width)
-			if status == "ok" {
-				fmt.Print(ColorGreen + pciText + ColorReset)
-			} else if status == "missing" {
+
+			if result.Status == "missing" {
 				fmt.Print(ColorRed + pciText + ColorReset)
+			} else if !result.PCILinesOK {
+				fmt.Print(ColorRed + pciText + ColorReset) // Красным если не соответствует требованиям
+			} else if result.Status == "warning" || result.Status == "error" {
+				fmt.Print(ColorYellow + pciText + ColorReset) // Желтым если у слота есть проблемы
+			} else if result.PCILinesWarn {
+				fmt.Print(ColorYellow + pciText + ColorReset) // Желтым если предупреждение
+			} else if result.Status == "ok" {
+				fmt.Print(ColorGreen + pciText + ColorReset)
 			} else {
 				fmt.Print(pciText)
 			}
@@ -830,24 +1010,31 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 	}
 	fmt.Println()
 
-	// Memory row
+	// Memory row with specific color coding for values
 	fmt.Print("│")
 	for i := 1; i <= maxSlots; i++ {
-		status := slotStatuses[i]
+		result := slotResults[i]
 
 		if slotData[i].Name != "" {
 			var memInfo string
-			if status == "missing" {
+			if result.Status == "missing" {
 				memInfo = "?"
 			} else {
 				memInfo = formatMemory(slotData[i].MemoryMB)
 			}
 
 			memText := centerText(memInfo, width)
-			if status == "ok" {
-				fmt.Print(ColorGreen + memText + ColorReset)
-			} else if status == "missing" {
+
+			if result.Status == "missing" {
 				fmt.Print(ColorRed + memText + ColorReset)
+			} else if !result.MemoryOK {
+				fmt.Print(ColorRed + memText + ColorReset) // Красным если не соответствует требованиям
+			} else if result.Status == "warning" || result.Status == "error" {
+				fmt.Print(ColorYellow + memText + ColorReset) // Желтым если у слота есть проблемы
+			} else if result.MemoryWarn {
+				fmt.Print(ColorYellow + memText + ColorReset) // Желтым если предупреждение
+			} else if result.Status == "ok" {
+				fmt.Print(ColorGreen + memText + ColorReset)
 			} else {
 				fmt.Print(memText)
 			}
@@ -901,39 +1088,15 @@ func visualizeSlots(gpus []GPUInfo, config *VisualizationConfig) error {
 
 	fmt.Println()
 
-	// Print legend
-	printInfo("Legend:")
-	fmt.Printf("  %s%s%s Present & OK  ", ColorGreen, "▓▓▓", ColorReset)
-	fmt.Printf("  %s%s%s Missing Device  ", ColorRed, "░░░", ColorReset)
-	fmt.Printf("  %s%s%s Empty Slot\n", ColorWhite, "░░░", ColorReset)
-
-	// Report issues
-	if len(missingDevices) > 0 {
-		fmt.Println()
-		printError("Missing devices:")
-		for _, device := range missingDevices {
-			printError(fmt.Sprintf("  - %s", device))
-		}
-	}
-
-	if len(unexpectedDevices) > 0 {
-		fmt.Println()
-		printWarning("Unexpected devices (not in configuration mapping):")
-		for _, pci := range unexpectedDevices {
-			printWarning(fmt.Sprintf("  - %s", pci))
-		}
-	}
-
+	// Final status message
 	if hasErrors {
-		fmt.Println()
 		printError("Configuration validation FAILED!")
-		printInfo("Update your configuration file to fix PCI to slot mappings:")
-		printInfo("  - Add missing devices to 'pci_to_slot' mapping")
-		printInfo("  - Remove mappings for devices that are no longer present")
 		return fmt.Errorf("GPU configuration validation failed")
+	} else if hasWarnings {
+		printWarning("Configuration validation completed with warnings")
+		return nil
 	} else {
-		fmt.Println()
-		printSuccess("All devices present and accounted for!")
+		printSuccess("All devices present and meet requirements!")
 		return nil
 	}
 }
@@ -1161,28 +1324,19 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Load configuration for visualization settings
+		// Load configuration for requirements checking
 		config, err := loadConfig(*configPath)
-		var visConfig *VisualizationConfig
 		if err != nil {
-			printWarning("Could not load configuration, using defaults for visualization")
-			// Use minimal visualization config - create simple mapping
-			visConfig = &VisualizationConfig{
-				DeviceMap:  make(map[string]DeviceVisual),
-				PCIToSlot:  make(map[string]int),
-				TotalSlots: len(gpus) + 2,
-				SlotWidth:  9,
-			}
-
-			// Create simple PCI to slot mapping for visualization
-			for i, gpu := range gpus {
-				visConfig.PCIToSlot[gpu.PCISlot] = i + 1
-			}
-		} else {
-			visConfig = &config.Visualization
+			printError(fmt.Sprintf("Error loading configuration: %v", err))
+			printInfo("Use -s to create a default configuration file")
+			printInfo("Cannot perform requirements checking without configuration")
+			os.Exit(1)
 		}
 
-		visualizeSlots(gpus, visConfig)
+		err = visualizeSlots(gpus, config)
+		if err != nil {
+			os.Exit(1)
+		}
 		return
 	}
 
