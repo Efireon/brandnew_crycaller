@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,9 +12,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/bougou/go-ipmi"
 )
 
-const VERSION = "1.0.0"
+const VERSION = "1.1.0"
 
 type FanInfo struct {
 	Name       string `json:"name"`
@@ -51,7 +56,8 @@ type VisualizationConfig struct {
 	PositionToSlot map[string]int       `json:"position_to_slot"` // position -> logical slot number
 	TotalSlots     int                  `json:"total_slots"`
 	SlotWidth      int                  `json:"slot_width"`
-	IgnoreRows     []string             `json:"ignore_rows"` // patterns to ignore during visualization, e.g. ["_2"]
+	IgnoreRows     []string             `json:"ignore_rows"`   // patterns to ignore during visualization, e.g. ["_2"]
+	MaxRowSlots    int                  `json:"max_row_slots"` // максимальное количество слотов в одном ряду для многорядной визуализации
 }
 
 type Config struct {
@@ -115,6 +121,7 @@ func showHelp() {
 	fmt.Println("  -s          Create default configuration file")
 	fmt.Println("  -l          List detected fans without configuration check")
 	fmt.Println("  -vis        Show visual fan layout")
+	fmt.Println("  -multirow   Show visual layout in multiple rows")
 	fmt.Println("  -d          Show detailed debug information")
 	fmt.Println("  -h          Show this help")
 }
@@ -122,45 +129,36 @@ func showHelp() {
 // === FAN DETECTION METHODS ===
 
 func getFanInfo() ([]FanInfo, error) {
-	var fans []FanInfo
+	type result struct {
+		fans []FanInfo
+		err  error
+	}
+	ch := make(chan result, 3)
 
-	// Method 1: Try lm-sensors first
-	printInfo("Method 1: Trying lm-sensors...")
-	fans, err := getFanInfoFromSensors()
-	if err == nil && len(fans) > 0 {
-		printSuccess(fmt.Sprintf("Found %d fans via lm-sensors", len(fans)))
-		return fans, nil
-	} else if err != nil {
-		printWarning(fmt.Sprintf("lm-sensors failed: %v", err))
-	} else {
-		printWarning("No fans found via lm-sensors")
+	// Launch parallel detection methods
+	go func() { fans, err := getFanInfoFromSensors(); ch <- result{fans, err} }()
+	go func() { fans, err := getFanInfoFromHwmon(); ch <- result{fans, err} }()
+	go func() { fans, err := getFanInfoFromIPMI(); ch <- result{fans, err} }()
+
+	var errs []error
+	for i := 0; i < 3; i++ {
+		res := <-ch
+		if res.err == nil && len(res.fans) > 0 {
+			return res.fans, nil
+		}
+		if res.err != nil {
+			errs = append(errs, res.err)
+		}
 	}
 
-	// Method 2: Try hwmon direct access
-	printInfo("Method 2: Trying /sys/class/hwmon...")
-	fans, err = getFanInfoFromHwmon()
-	if err == nil && len(fans) > 0 {
-		printSuccess(fmt.Sprintf("Found %d fans via hwmon", len(fans)))
-		return fans, nil
-	} else if err != nil {
-		printWarning(fmt.Sprintf("hwmon failed: %v", err))
-	} else {
-		printWarning("No fans found via hwmon")
+	var sb strings.Builder
+	sb.WriteString("no fans found using any detection method:")
+	for _, e := range errs {
+		sb.WriteString(" ")
+		sb.WriteString(e.Error())
+		sb.WriteString(";")
 	}
-
-	// Method 3: Try IPMI for server hardware
-	printInfo("Method 3: Trying IPMI (server hardware)...")
-	fans, err = getFanInfoFromIPMI()
-	if err == nil && len(fans) > 0 {
-		printSuccess(fmt.Sprintf("Found %d fans via IPMI", len(fans)))
-		return fans, nil
-	} else if err != nil {
-		printWarning(fmt.Sprintf("IPMI failed: %v", err))
-	} else {
-		printWarning("No fans found via IPMI")
-	}
-
-	return fans, fmt.Errorf("no fans found using any detection method")
+	return nil, fmt.Errorf("%s", sb.String())
 }
 
 func getFanInfoFromSensors() ([]FanInfo, error) {
@@ -285,25 +283,81 @@ func getFanInfoFromHwmon() ([]FanInfo, error) {
 }
 
 func getFanInfoFromIPMI() ([]FanInfo, error) {
-	// Check if ipmitool command exists
-	if _, err := exec.LookPath("ipmitool"); err != nil {
-		return nil, fmt.Errorf("ipmitool command not found")
-	}
-
-	// Run ipmitool to get sensor information
-	cmd := exec.Command("ipmitool", "sensor", "list")
-	output, err := cmd.Output()
+	client, err := ipmi.NewOpenClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to run ipmitool sensor list: %v", err)
+		return nil, fmt.Errorf("new IPMI client: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("connect to BMC: %v", err)
+	}
+	defer client.Close(ctx)
+
+	sdrs, err := client.GetSDRs(ctx,
+		ipmi.SDRRecordTypeFullSensor,
+		ipmi.SDRRecordTypeCompactSensor,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("GetSDRs failed: %w", err)
 	}
 
-	outputStr := string(output)
-	if debugMode {
-		printDebug("ipmitool sensor list output:")
-		printDebug(outputStr)
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		fans     []FanInfo
+		firstErr error
+	)
+
+	// Iterate SDRs and fire goroutine per fan
+	for _, sdr := range sdrs {
+		// Only FullSensor records can be analog fans
+		if sdr.Full == nil {
+			continue
+		}
+		// Must have analog reading and be a FAN type
+		if !sdr.HasAnalogReading() || sdr.Full.SensorType != ipmi.SensorTypeFan {
+			continue
+		}
+
+		name := sdr.SensorName()
+		num := uint8(sdr.SensorNumber())
+
+		wg.Add(1)
+		go func(name string, num uint8) {
+			defer wg.Done()
+			resp, err := client.GetSensorByID(ctx, num)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			fans = append(fans, FanInfo{
+				Name:       name,
+				Position:   normalizeIPMIFanPosition(name),
+				CurrentRPM: int(resp.Value),
+				Status:     resp.Status(),
+				Sensor:     "IPMI",
+				FanType:    determineIPMIFanType(name),
+				MinRPM:     int(resp.Threshold.LNC),
+				MaxRPM:     int(resp.Threshold.UNC),
+			})
+			mu.Unlock()
+		}(name, num)
 	}
 
-	return parseIPMIOutput(outputStr), nil
+	wg.Wait()
+	if len(fans) == 0 {
+		if firstErr != nil {
+			return nil, fmt.Errorf("no fans found via IPMI: %v", firstErr)
+		}
+		return nil, fmt.Errorf("no fan sensors detected via IPMI")
+	}
+	return fans, nil
 }
 
 // === PARSING FUNCTIONS ===
@@ -400,77 +454,6 @@ func parseFanLine(line, chipName string) FanInfo {
 		fan.Status = "ALARM"
 	} else {
 		fan.Status = "OK"
-	}
-
-	return fan
-}
-
-func parseIPMIOutput(output string) []FanInfo {
-	var fans []FanInfo
-
-	lines := strings.Split(output, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if strings.Contains(strings.ToUpper(line), "FAN") && strings.Contains(strings.ToUpper(line), "RPM") {
-			fan := parseIPMIFanLine(line)
-			if fan.Name != "" {
-				fans = append(fans, fan)
-			}
-		}
-	}
-
-	return fans
-}
-
-func parseIPMIFanLine(line string) FanInfo {
-	var fan FanInfo
-	fan.Sensor = "IPMI"
-
-	// Split by | and trim spaces
-	parts := strings.Split(line, "|")
-	if len(parts) < 4 {
-		return fan
-	}
-
-	fanName := strings.TrimSpace(parts[0])
-	rpmValue := strings.TrimSpace(parts[1])
-	unit := strings.TrimSpace(parts[2])
-	status := strings.TrimSpace(parts[3])
-
-	// Verify this is a fan with RPM unit
-	if !strings.Contains(strings.ToUpper(unit), "RPM") {
-		return fan
-	}
-
-	fan.Name = fanName
-	fan.Position = normalizeIPMIFanPosition(fanName)
-	fan.FanType = determineIPMIFanType(fanName)
-
-	// Parse status first - if N/A, this is physically absent fan
-	switch strings.ToLower(status) {
-	case "ok":
-		fan.Status = "OK"
-	case "nc", "na":
-		fan.Status = "N/A"
-		return fan // Don't parse RPM for N/A fans
-	case "cr", "critical":
-		fan.Status = "FAIL"
-	case "nr", "non-recoverable":
-		fan.Status = "FAIL"
-	default:
-		fan.Status = strings.ToUpper(status)
-	}
-
-	// Parse RPM value only if fan is present
-	if rpmValue != "na" && rpmValue != "" {
-		if rpmFloat, err := strconv.ParseFloat(rpmValue, 64); err == nil {
-			fan.CurrentRPM = int(rpmFloat)
-		}
 	}
 
 	return fan
@@ -688,15 +671,6 @@ func findFanByPosition(fans []FanInfo, position string) *FanInfo {
 	return nil
 }
 
-func shouldIgnorePosition(position string, ignorePatterns []string) bool {
-	for _, pattern := range ignorePatterns {
-		if strings.Contains(position, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
 func filterFansByIgnorePatterns(fans []FanInfo, ignorePatterns []string) []FanInfo {
 	if len(ignorePatterns) == 0 {
 		return fans
@@ -721,6 +695,55 @@ func filterFansByIgnorePatterns(fans []FanInfo, ignorePatterns []string) []FanIn
 	}
 
 	return filtered
+}
+
+// Новая функция для фильтрации позиций в конфигурации
+func filterPositionToSlotByIgnorePatterns(positionToSlot map[string]int, ignorePatterns []string) map[string]int {
+	if len(ignorePatterns) == 0 {
+		return positionToSlot
+	}
+
+	filtered := make(map[string]int)
+
+	for position, slot := range positionToSlot {
+		shouldIgnore := false
+		for _, pattern := range ignorePatterns {
+			if strings.Contains(position, pattern) {
+				shouldIgnore = true
+				if debugMode {
+					printDebug(fmt.Sprintf("Removing position %s (slot %d) from visualization due to ignore pattern", position, slot))
+				}
+				break
+			}
+		}
+
+		if !shouldIgnore {
+			filtered[position] = slot
+		}
+	}
+
+	// Пересчитываем слоты для непрерывной нумерации
+	var positions []string
+	for position := range filtered {
+		positions = append(positions, position)
+	}
+
+	// Сортируем позиции по исходным номерам слотов
+	for i := 0; i < len(positions)-1; i++ {
+		for j := i + 1; j < len(positions); j++ {
+			if positionToSlot[positions[i]] > positionToSlot[positions[j]] {
+				positions[i], positions[j] = positions[j], positions[i]
+			}
+		}
+	}
+
+	// Присваиваем новые последовательные номера слотов
+	result := make(map[string]int)
+	for i, position := range positions {
+		result[position] = i + 1
+	}
+
+	return result
 }
 
 func getFanVisualByType(fan FanInfo, config *VisualizationConfig) FanVisual {
@@ -905,6 +928,7 @@ func createDefaultConfig(configPath string) error {
 			TotalSlots:     len(allFans) + 2,
 			SlotWidth:      9,
 			IgnoreRows:     ignoreRows,
+			MaxRowSlots:    8, // По умолчанию максимум 8 слотов в ряду
 		},
 		CheckTargetRPM: false,
 	}
@@ -948,6 +972,11 @@ func loadConfig(configPath string) (*Config, error) {
 	err = json.Unmarshal(data, &config)
 	if err != nil {
 		return nil, err
+	}
+
+	// Set default values if not specified
+	if config.Visualization.MaxRowSlots == 0 {
+		config.Visualization.MaxRowSlots = 8
 	}
 
 	return &config, nil
@@ -1209,21 +1238,39 @@ func checkFans(config *Config) error {
 // === VISUALIZATION FUNCTIONS ===
 
 func visualizeSlots(fans []FanInfo, config *Config) error {
-	printInfo("Fan Layout:")
+	return visualizeSlotsInternal(fans, config, false)
+}
+
+func visualizeSlotsMultiRow(fans []FanInfo, config *Config) error {
+	return visualizeSlotsInternal(fans, config, true)
+}
+
+func visualizeSlotsInternal(fans []FanInfo, config *Config, multiRow bool) error {
+	if multiRow {
+		printInfo("Fan Layout (Multi-Row):")
+	} else {
+		printInfo("Fan Layout:")
+	}
 	fmt.Println()
 
-	// Apply ignore patterns ONLY for visualization
+	// Apply ignore patterns для полного удаления игнорированных рядов
 	allFans := fans
 	displayFans := filterFansByIgnorePatterns(fans, config.Visualization.IgnoreRows)
 
+	// Фильтруем также позиции в конфигурации
+	filteredPositionToSlot := filterPositionToSlotByIgnorePatterns(config.Visualization.PositionToSlot, config.Visualization.IgnoreRows)
+
 	if len(displayFans) < len(allFans) {
 		printInfo(fmt.Sprintf("Applying visualization filters: showing %d of %d fans", len(displayFans), len(allFans)))
+		for _, pattern := range config.Visualization.IgnoreRows {
+			printInfo(fmt.Sprintf("  - Ignoring rows matching pattern: '%s'", pattern))
+		}
 	}
 
-	// Calculate max slots based on display fans
+	// Calculate max slots based on filtered positions
 	maxSlots := 0
-	for _, fan := range displayFans {
-		if slot, exists := config.Visualization.PositionToSlot[fan.Position]; exists && slot > maxSlots {
+	for _, slot := range filteredPositionToSlot {
+		if slot > maxSlots {
 			maxSlots = slot
 		}
 	}
@@ -1240,7 +1287,7 @@ func visualizeSlots(fans []FanInfo, config *Config) error {
 	foundPositions := make(map[string]bool)
 	for _, fan := range displayFans {
 		foundPositions[fan.Position] = true
-		if logicalSlot, exists := config.Visualization.PositionToSlot[fan.Position]; exists {
+		if logicalSlot, exists := filteredPositionToSlot[fan.Position]; exists {
 			if logicalSlot > 0 && logicalSlot <= maxSlots {
 				slotData[logicalSlot] = fan
 				slotResults[logicalSlot] = checkFanAgainstRequirements(fan, config.FanRequirements)
@@ -1254,8 +1301,8 @@ func visualizeSlots(fans []FanInfo, config *Config) error {
 	missingFans := []string{}
 	statusChangedFans := []string{}
 
-	for position, expectedSlot := range config.Visualization.PositionToSlot {
-		if expectedSlot == 0 || shouldIgnorePosition(position, config.Visualization.IgnoreRows) {
+	for position, expectedSlot := range filteredPositionToSlot {
+		if expectedSlot == 0 {
 			continue
 		}
 
@@ -1333,7 +1380,33 @@ func visualizeSlots(fans []FanInfo, config *Config) error {
 		fmt.Println()
 	}
 
-	// Build visualization table
+	// Choose visualization method
+	if multiRow {
+		err := renderMultiRowVisualization(slotData, slotResults, config, maxSlots)
+		if err != nil {
+			return err
+		}
+	} else {
+		err := renderSingleRowVisualization(slotData, slotResults, config, maxSlots)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Final status
+	if hasErrors {
+		printError("Fan configuration validation FAILED!")
+		return fmt.Errorf("fan configuration validation failed")
+	} else if hasWarnings {
+		printWarning("Fan configuration validation completed with warnings")
+		return nil
+	} else {
+		printSuccess("All fans match expected configuration!")
+		return nil
+	}
+}
+
+func renderSingleRowVisualization(slotData []FanInfo, slotResults []FanCheckResult, config *Config, maxSlots int) error {
 	width := config.Visualization.SlotWidth
 
 	// Top border
@@ -1509,17 +1582,172 @@ func visualizeSlots(fans []FanInfo, config *Config) error {
 
 	fmt.Println()
 
-	// Final status
-	if hasErrors {
-		printError("Fan configuration validation FAILED!")
-		return fmt.Errorf("fan configuration validation failed")
-	} else if hasWarnings {
-		printWarning("Fan configuration validation completed with warnings")
-		return nil
-	} else {
-		printSuccess("All fans match expected configuration!")
-		return nil
+	return nil
+}
+
+func renderMultiRowVisualization(slotData []FanInfo, slotResults []FanCheckResult, config *Config, maxSlots int) error {
+	width := config.Visualization.SlotWidth
+	maxRowSlots := config.Visualization.MaxRowSlots
+	if maxRowSlots == 0 {
+		maxRowSlots = 8
 	}
+
+	totalRows := (maxSlots + maxRowSlots - 1) / maxRowSlots
+
+	for row := 0; row < totalRows; row++ {
+		startSlot := row*maxRowSlots + 1
+		endSlot := startSlot + maxRowSlots - 1
+		if endSlot > maxSlots {
+			endSlot = maxSlots
+		}
+		rowSlots := endSlot - startSlot + 1
+
+		fmt.Printf("Row %d (Slots %d-%d):\n", row+1, startSlot, endSlot)
+
+		// Top border
+		fmt.Print("┌")
+		for i := 0; i < rowSlots; i++ {
+			fmt.Print(strings.Repeat("─", width))
+			if i < rowSlots-1 {
+				fmt.Print("┬")
+			}
+		}
+		fmt.Println("┐")
+
+		// Symbols row
+		fmt.Print("│")
+		for i := 0; i < rowSlots; i++ {
+			slotIdx := startSlot + i
+			visual := getFanVisualByType(slotData[slotIdx], &config.Visualization)
+			result := slotResults[slotIdx]
+			expectedStatus := getExpectedStatus(slotData[slotIdx].Position, config.FanRequirements)
+
+			symbolText := centerText(visual.Symbol, width)
+
+			if expectedStatus == "N/A" && slotData[slotIdx].Status == "N/A" {
+				fmt.Print(ColorGreen + centerText("░░░", width) + ColorReset)
+			} else {
+				switch result.Status {
+				case "ok":
+					fmt.Print(ColorGreen + symbolText + ColorReset)
+				case "warning", "error":
+					fmt.Print(ColorYellow + symbolText + ColorReset)
+				case "missing":
+					fmt.Print(ColorRed + centerText("░░░", width) + ColorReset)
+				default:
+					fmt.Print(symbolText)
+				}
+			}
+			fmt.Print("│")
+		}
+		fmt.Println()
+
+		// Short names row
+		fmt.Print("│")
+		for i := 0; i < rowSlots; i++ {
+			slotIdx := startSlot + i
+			result := slotResults[slotIdx]
+			expectedStatus := getExpectedStatus(slotData[slotIdx].Position, config.FanRequirements)
+
+			if slotData[slotIdx].Name != "" {
+				visual := getFanVisualByType(slotData[slotIdx], &config.Visualization)
+				nameText := centerText(visual.ShortName, width)
+
+				if expectedStatus == "N/A" && slotData[slotIdx].Status == "N/A" {
+					fmt.Print(ColorGreen + centerText("N/A", width) + ColorReset)
+				} else {
+					switch result.Status {
+					case "ok":
+						fmt.Print(ColorGreen + nameText + ColorReset)
+					case "warning", "error":
+						fmt.Print(ColorYellow + nameText + ColorReset)
+					case "missing":
+						fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
+					default:
+						fmt.Print(nameText)
+					}
+				}
+			} else {
+				fmt.Print(strings.Repeat(" ", width))
+			}
+			fmt.Print("│")
+		}
+		fmt.Println()
+
+		// RPM row
+		fmt.Print("│")
+		for i := 0; i < rowSlots; i++ {
+			slotIdx := startSlot + i
+			result := slotResults[slotIdx]
+			expectedStatus := getExpectedStatus(slotData[slotIdx].Position, config.FanRequirements)
+
+			if slotData[slotIdx].Name != "" {
+				var rpmInfo string
+				if result.Status == "missing" {
+					rpmInfo = "?"
+				} else if expectedStatus == "N/A" && slotData[slotIdx].Status == "N/A" {
+					rpmInfo = "N/A"
+				} else {
+					rpmInfo = formatRPM(slotData[slotIdx].CurrentRPM)
+				}
+
+				rpmText := centerText(rpmInfo, width)
+
+				if result.Status == "missing" {
+					fmt.Print(ColorRed + rpmText + ColorReset)
+				} else if expectedStatus == "N/A" && slotData[slotIdx].Status == "N/A" {
+					fmt.Print(ColorGreen + rpmText + ColorReset)
+				} else if !result.RPMOK {
+					fmt.Print(ColorRed + rpmText + ColorReset)
+				} else if result.Status == "warning" || result.Status == "error" {
+					fmt.Print(ColorYellow + rpmText + ColorReset)
+				} else if result.Status == "ok" {
+					fmt.Print(ColorGreen + rpmText + ColorReset)
+				} else {
+					fmt.Print(rpmText)
+				}
+			} else {
+				fmt.Print(strings.Repeat(" ", width))
+			}
+			fmt.Print("│")
+		}
+		fmt.Println()
+
+		// Bottom border
+		fmt.Print("└")
+		for i := 0; i < rowSlots; i++ {
+			fmt.Print(strings.Repeat("─", width))
+			if i < rowSlots-1 {
+				fmt.Print("┴")
+			}
+		}
+		fmt.Println("┘")
+
+		// Labels
+		fmt.Print(" ")
+		for i := 0; i < rowSlots; i++ {
+			slotIdx := startSlot + i
+			fmt.Print(centerText(fmt.Sprintf("%d", slotIdx), width+1))
+		}
+		fmt.Println("(Logic)")
+
+		fmt.Print(" ")
+		for i := 0; i < rowSlots; i++ {
+			slotIdx := startSlot + i
+			position := ""
+			if slotData[slotIdx].Name != "" {
+				position = slotData[slotIdx].Position
+			} else {
+				position = "-"
+			}
+			fmt.Print(centerText(position, width+1))
+		}
+		fmt.Println("(Position)")
+
+		fmt.Println()
+	}
+
+	return nil
 }
 
 // === MAIN FUNCTION ===
@@ -1532,6 +1760,7 @@ func main() {
 		showHelpFlag = flag.Bool("h", false, "Show help")
 		listOnly     = flag.Bool("l", false, "List detected fans without configuration check")
 		visualize    = flag.Bool("vis", false, "Show visual fan layout")
+		multiRow     = flag.Bool("multirow", false, "Show visual layout in multiple rows")
 		debugFlag    = flag.Bool("d", false, "Show detailed debug information")
 	)
 
@@ -1587,7 +1816,7 @@ func main() {
 		return
 	}
 
-	if *visualize {
+	if *visualize || *multiRow {
 		printInfo("Scanning for fans...")
 		fans, err := getFanInfo()
 		if err != nil {
@@ -1602,7 +1831,11 @@ func main() {
 			os.Exit(1)
 		}
 
-		err = visualizeSlots(fans, config)
+		if *multiRow {
+			err = visualizeSlotsMultiRow(fans, config)
+		} else {
+			err = visualizeSlots(fans, config)
+		}
 		if err != nil {
 			os.Exit(1)
 		}
