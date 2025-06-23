@@ -4,4 +4,5 @@ build_gpu_test:
 
 build_fan_test:
 	(cd source/fan_test && go mod tidy)
-	go build -o bin/fan_test source/fan_test/main.go
+	(cd source/fan_test && go build -o fan_test main.go)
+	mv source/fan_test/fan_test bin/
