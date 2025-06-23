@@ -63,15 +63,20 @@ type VisualizationConfig struct {
 }
 
 type Config struct {
-	GPURequirements []GPURequirement    `json:"gpu_requirements"`
-	Visualization   VisualizationConfig `json:"visualization"`
-	CheckPower      bool                `json:"check_power"`
+	GPURequirements []GPURequirement        `json:"gpu_requirements"`
+	Visualization   VisualizationConfig     `json:"visualization"`
+	CheckPower      bool                    `json:"check_power"`
+	Exclude         map[string]ExcludeEntry `json:"exclude,omitempty"`
+}
+
+type ExcludeEntry struct {
+	MinPCILines int `json:"min_pci_lines"`
 }
 
 // ANSI color codes
 const (
 	ColorReset  = "\033[0m"
-	ColorGreen  = "\033[32m"
+	ColorGreen  = "\033[92m"
 	ColorBlue   = "\033[34m"
 	ColorWhite  = "\033[37m"
 	ColorYellow = "\033[33m"
@@ -369,19 +374,16 @@ func shortenVendorName(vendor string) string {
 	}
 }
 
-func loadConfig(configPath string) (*Config, error) {
-	data, err := ioutil.ReadFile(configPath)
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
-	var config Config
-	err = json.Unmarshal(data, &config)
-	if err != nil {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-
-	return &config, nil
+	return &cfg, nil
 }
 
 func getGPUInfo() ([]GPUInfo, error) {
@@ -699,7 +701,8 @@ func formatMemory(memoryMB int) string {
 }
 
 // Новая функция для проверки GPU против требований
-func checkGPUAgainstRequirements(gpu GPUInfo, requirements []GPURequirement) GPUCheckResult {
+// checkGPUAgainstRequirements проверяет один GPU по общим требованиям и per-slot исключениям
+func checkGPUAgainstRequirements(gpu GPUInfo, requirements []GPURequirement, exclude map[string]ExcludeEntry) GPUCheckResult {
 	result := GPUCheckResult{
 		Status:     "ok",
 		PCILinesOK: true,
@@ -707,13 +710,10 @@ func checkGPUAgainstRequirements(gpu GPUInfo, requirements []GPURequirement) GPU
 		DriverOK:   true,
 	}
 
-	// Find matching requirements for this GPU
+	// Находим требования, применимые к этому GPU
 	var matchingReqs []GPURequirement
-
 	for _, req := range requirements {
-		// Check if this GPU matches the requirement
 		if len(req.DeviceIDs) > 0 {
-			// Check specific device IDs
 			for _, deviceID := range req.DeviceIDs {
 				if gpu.DeviceID == deviceID {
 					matchingReqs = append(matchingReqs, req)
@@ -721,69 +721,75 @@ func checkGPUAgainstRequirements(gpu GPUInfo, requirements []GPURequirement) GPU
 				}
 			}
 		} else if req.Vendor != "" && req.Vendor != "any" {
-			// Check vendor
 			if gpu.Vendor == req.Vendor {
 				matchingReqs = append(matchingReqs, req)
 			}
 		}
 	}
-
 	if len(matchingReqs) == 0 {
-		// No requirements found for this GPU - not necessarily an error
+		// Нет требований для этого GPU
 		return result
 	}
 
 	hasErrors := false
 	hasWarnings := false
 
-	// Check against all matching requirements
+	// Проверяем каждое совпавшее требование
 	for _, req := range matchingReqs {
-		// Check PCI lanes
+		// PCI lines с учётом исключений
 		if req.MinPCILines > 0 {
+			effectiveMin := req.MinPCILines
+			if excl, ok := exclude[gpu.PCISlot]; ok && excl.MinPCILines > 0 {
+				effectiveMin = excl.MinPCILines
+			}
+
 			if gpu.PCILines == 0 {
 				result.Issues = append(result.Issues, "Could not determine active PCI lanes")
 				result.PCILinesWarn = true
 				hasWarnings = true
-			} else if gpu.PCILines < req.MinPCILines {
-				result.Issues = append(result.Issues, fmt.Sprintf("PCI lanes: %d active (required %d)", gpu.PCILines, req.MinPCILines))
+			} else if gpu.PCILines < effectiveMin {
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("PCI lanes: %d active (required %d)", gpu.PCILines, effectiveMin))
 				result.PCILinesOK = false
 				hasErrors = true
 			}
 		}
 
-		// Check memory
+		// Memory
 		if req.MinMemoryMB > 0 {
 			if gpu.MemoryMB == 0 {
 				result.Issues = append(result.Issues, "Could not determine memory size")
 				result.MemoryWarn = true
 				hasWarnings = true
 			} else if gpu.MemoryMB < req.MinMemoryMB {
-				result.Issues = append(result.Issues, fmt.Sprintf("Memory: %d MB (required %d MB)", gpu.MemoryMB, req.MinMemoryMB))
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("Memory: %d MB (required %d MB)", gpu.MemoryMB, req.MinMemoryMB))
 				result.MemoryOK = false
 				hasErrors = true
 			}
 		}
 
-		// Check driver
+		// Driver
 		if req.Driver != "" {
 			if gpu.Driver == "unknown" {
 				result.Issues = append(result.Issues, "Could not determine driver")
 				result.DriverWarn = true
 				hasWarnings = true
 			} else if gpu.Driver != req.Driver {
-				result.Issues = append(result.Issues, fmt.Sprintf("Driver: %s (required %s)", gpu.Driver, req.Driver))
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("Driver: %s (required %s)", gpu.Driver, req.Driver))
 				result.DriverOK = false
 				hasErrors = true
 			}
 		}
 	}
 
+	// Итоговый статус
 	if hasErrors {
 		result.Status = "error"
 	} else if hasWarnings {
 		result.Status = "warning"
 	}
-
 	return result
 }
 
@@ -813,7 +819,7 @@ func visualizeSlots(gpus []GPUInfo, config *Config) error {
 				physicalSlots[logicalSlot] = gpu.PhysicalSlot
 
 				// Check this GPU against requirements
-				slotResults[logicalSlot] = checkGPUAgainstRequirements(gpu, config.GPURequirements)
+				slotResults[logicalSlot] = checkGPUAgainstRequirements(gpu, config.GPURequirements, config.Exclude)
 			}
 		}
 	}
