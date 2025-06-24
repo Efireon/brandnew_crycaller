@@ -1,0 +1,58 @@
+{
+    "background_scripts": [
+        {
+            "path": "/root/progs/modules/scripts/RAM_test.sh",
+            "args": "-c /root/progs/modules/.data/Mercury_ram_info.json",
+            "type": "script",
+            "max_logs": 2,
+            "output": false
+        },
+        {
+            "path": "/root/progs/modules/scripts/disk_test.sh",
+            "args": "-d 6",
+            "type": "script",
+            "max_logs": 2,
+            "output": true,
+            "output_res": "SxS"
+        },
+        {
+            "path": "/root/progs/modules/scripts/net_test.sh",
+            "args": "-c /root/progs/modules/.data/Mercury_net_cfg.json",
+            "type": "script",
+            "max_logs": 0,
+            "output": false
+        },
+        {
+            "path": "/root/progs/modules/bin/video_test",
+            "args": "-c /root/progs/modules/.data/Mercury_video_cfg.json",
+            "type": "binary",
+            "max_logs": 0,
+            "output": false
+        },
+        {
+            "path": "/root/progs/modules/bin/mic_test",
+            "args": "-y 3 -f 500 -t 5s",
+            "type": "binary",
+            "max_logs": 0,
+            "output": false
+        },
+        {
+            "path": "/root/progs/modules/bin/usb_test",
+            "args": "-T -c /root/progs/modules/.data/Mercury_usb_test.json",
+            "type": "curses",
+            "max_logs": 5,
+            "output": true,
+            "output_res": "10x45"
+        },
+        {
+            "path": "/root/progs/modules/bin/cam_test",
+            "args": "-d -n -model /root/progs/modules/.data/haarcascade_frontalface_default.xml",
+            "type": "binary",
+            "max_logs": 5,
+            "output": false
+        }
+    ],
+    "interactive_scripts": [
+
+    ]
+}
