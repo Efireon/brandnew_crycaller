@@ -1,0 +1,83 @@
+# Конфигурация для Firestarter
+system:
+  product: "SP2C621D32TM3"                              # Продукт, на который расчитана данная конфигурация
+  require_root: true                                    # Требовать root привилегии
+  guid_prefix: "8be4df61-93ca-11d2-aa0d-00e098032b8c"   # GUID префикс для EFI переменных
+  efi_sn_name: "SerialNumber"                           # Имя EFI переменной для серийного номера
+  efi_mac_name: "HexMac"                                # Имя EFI переменной для MAC адреса
+  driver_dir: "/root/progs/modules/.drivers"            # Директория для драйверов
+
+
+# Конфигурация тестов
+tests:
+  timeout: "5m"  # Общий таймаут для тестов
+  
+  # Параллельные группы тестов (выполняются одновременно)
+  parallel_groups:
+    - # Группа 1: Быстрые системные тесты
+      - name: "CPU Test"
+        command: "./cpu_test"
+        args: ["-vis", "-c", ".data/cpu_config.json"]
+        type: "standard"
+        timeout: "10s"
+        required: true
+    - # Вторая группа тестов
+      - name: "Memory Test"
+        command: "./ram_test"
+        args: ["-vis", "-c", ".data/ram_config.json"]
+        type: "standard"
+        timeout: "10s"
+        required: true
+
+      - name: "GPU Test"
+        command: "./gpu_test"
+        args: ["-vis", "-c", ".data/gpu_config.json"]
+        type: "standard"
+        timeout: "10s"
+        required: true
+
+      - name: "Fan Test"
+        command: "./fan_test"
+        args: ["-vis", "-c", ".data/fan_config.json"]
+        type: "standard" 
+        timeout: "30s"
+        required: true
+
+  # Последовательные группы тестов (выполняются по очереди)
+  sequential_groups:
+    - # Первая группа тестов
+
+
+# Конфигурация прошивки
+flash:
+  enabled: true
+  operations:
+    - "serial"  # Прошивка серийных номеров
+    - "mac"     # Прошивка MAC адресов
+    - "efi"     # Запись EFI переменных
+  fields:
+    - name: "System serial"
+      flash: true                                     # Требуется ли его прошивать
+      id: "system-serial-number"                      # Что это такое
+      regex: "^INF0[0-9]{1}A9[0-9]{8}$"               # Поле для мат платы
+
+    #- name: "IO board"
+    #  flash: false
+    #  id: "io_board"
+    #  regex: "^INF0[0-9]{1}A4[0-9]{8}$"               # Поле для доп платы
+
+    - name: "MAC address"
+      flash: true
+      id: "mac_address"
+      regex: "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"   # Поле для MAC адреса
+
+  method: "eeupdate"                                  # Метод прошивки (rtnicpg/eeupdate) на основе продукта
+
+# Конфигурация логирования
+log:
+  save_local: true
+  send_logs: true
+  log_dir: "logs"
+  server: "serverwing@10.10.200.130"  # Опционально для отправки логов
+  server_dir: "test_logs_dir"         # Путь до папки с логами. Итоговый путь ssh складывается так - server+server_dir+product+op_name
+  op_name: "unknown_tester"           # Имя операторая
