@@ -20,27 +20,30 @@ tests:
         args: ["-vis", "-c", ".data/cpu_config.json"]
         type: "standard"
         timeout: "10s"
+        collapse: true
         required: true
+      - name: "GPU Test"
+        command: "./gpu_test"
+        args: ["-vis", "-c", ".data/gpu_config.json"]
+        type: "standard"
+        timeout: "10s"
+        collapse: true
+        required: true
+
     - # Вторая группа тестов
       - name: "Memory Test"
         command: "./ram_test"
         args: ["-vis", "-c", ".data/ram_config.json"]
         type: "standard"
         timeout: "10s"
+        collapse: true
         required: true
-
-      - name: "GPU Test"
-        command: "./gpu_test"
-        args: ["-vis", "-c", ".data/gpu_config.json"]
-        type: "standard"
-        timeout: "10s"
-        required: true
-
       - name: "Fan Test"
         command: "./fan_test"
         args: ["-vis", "-c", ".data/fan_config.json"]
         type: "standard" 
         timeout: "30s"
+        collapse: false
         required: true
 
   # Последовательные группы тестов (выполняются по очереди)

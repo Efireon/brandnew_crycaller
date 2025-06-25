@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,12 +22,21 @@ const VERSION = "2.0.3"
 
 // ANSI color codes
 const (
+	// Существующие константы остаются
 	ColorReset  = "\033[0m"
 	ColorGreen  = "\033[92m"
 	ColorBlue   = "\033[34m"
 	ColorWhite  = "\033[37m"
 	ColorYellow = "\033[33m"
 	ColorRed    = "\033[31m"
+	ColorGray   = "\033[90m" // Добавить если нет
+	ColorCyan   = "\033[36m" // Добавить если нет
+
+	// НОВЫЕ константы для фонов:
+	ColorBgGreen  = "\033[42m\033[30m" // Зеленый фон, черный текст
+	ColorBgRed    = "\033[41m\033[37m" // Красный фон, белый текст
+	ColorBgYellow = "\033[43m\033[30m" // Желтый фон, черный текст
+	ColorBgBlue   = "\033[44m\033[37m" // Синий фон, белый текст
 )
 
 // Configuration structures
@@ -59,6 +69,7 @@ type TestSpec struct {
 	Type     string   `yaml:"type"`
 	Timeout  string   `yaml:"timeout,omitempty"`
 	Required bool     `yaml:"required"`
+	Collapse bool     `yaml:"collapse,omitempty"` // Новое поле: если true — при успехе не показываем вывод
 }
 
 type FlashField struct {
@@ -167,68 +178,284 @@ type OutputManager struct {
 	mutex sync.Mutex
 }
 
+// getTerminalWidth получает ширину терминала
+func getTerminalWidth() int {
+	// Попробуем получить через stty
+	cmd := exec.Command("stty", "size")
+	cmd.Stdin = os.Stdin
+	if output, err := cmd.Output(); err == nil {
+		parts := strings.Fields(string(output))
+		if len(parts) >= 2 {
+			if w, err := strconv.Atoi(parts[1]); err == nil && w > 0 {
+				return w
+			}
+		}
+	}
+
+	// Fallback на переменную окружения
+	if width := os.Getenv("COLUMNS"); width != "" {
+		if w, err := strconv.Atoi(width); err == nil && w > 0 {
+			return w
+		}
+	}
+
+	// Значение по умолчанию
+	return 80
+}
+
+// printSeparator печатает горизонтальную линию по ширине терминала
+func printSeparator() {
+	width := getTerminalWidth()
+	fmt.Printf("%s%s%s\n", ColorGray, strings.Repeat("─", width), ColorReset)
+}
+
+// printThickSeparator печатает толстую горизонтальную линию
+func printThickSeparator() {
+	width := getTerminalWidth()
+	fmt.Printf("%s%s%s\n", ColorGray, strings.Repeat("═", width), ColorReset)
+}
+
 func (om *OutputManager) PrintSection(title, content string) {
 	om.mutex.Lock()
 	defer om.mutex.Unlock()
 
-	fmt.Printf("\n--- %s ---\n", title)
+	fmt.Printf("\n%s%s%s\n", ColorWhite, strings.ToUpper(title), ColorReset)
+	printSeparator()
+
+	// Выводим контент как есть
 	fmt.Print(content)
 	if !strings.HasSuffix(content, "\n") {
 		fmt.Println()
 	}
+
+	// Пустая строка после контента для отделения от результата
+	fmt.Println()
 }
 
 func (om *OutputManager) PrintResult(timestamp time.Time, name, status string, duration time.Duration, err string) {
 	om.mutex.Lock()
 	defer om.mutex.Unlock()
 
-	var icon, color string
+	// Форматируем статус в enterprise стиле
+	var statusBlock string
 	switch status {
 	case "PASSED":
-		icon = "PASS"
-		color = ColorGreen
+		statusBlock = fmt.Sprintf("%s PASSED %s", ColorBgGreen, ColorReset)
 	case "FAILED":
-		icon = "FAIL"
-		color = ColorRed
+		statusBlock = fmt.Sprintf("%s FAILED %s", ColorBgRed, ColorReset)
 	case "TIMEOUT":
-		icon = "TIME"
-		color = ColorYellow
+		statusBlock = fmt.Sprintf("%s TIMEOUT %s", ColorBgYellow, ColorReset)
 	case "SKIPPED":
-		icon = "SKIP"
-		color = ColorYellow
+		statusBlock = fmt.Sprintf("%s SKIPPED %s", ColorBgYellow, ColorReset)
 	case "RUNNING":
-		icon = "RUN "
-		color = ColorBlue
+		statusBlock = fmt.Sprintf("%s RUNNING %s", ColorBgBlue, ColorReset)
 	default:
-		icon = "UNKN"
-		color = ColorWhite
+		statusBlock = fmt.Sprintf("%s UNKNOWN %s", ColorWhite, ColorReset)
 	}
 
-	fmt.Printf("[%s] [%s%s%s] %-40s %s\n",
-		timestamp.Format("15:04:05"),
-		color, icon, ColorReset,
-		name,
-		duration.Round(100*time.Millisecond))
+	// Основная строка результата
+	fmt.Printf("%s[%s]%s %s | Duration: %s%s%s",
+		ColorGray, timestamp.Format("15:04:05"), ColorReset,
+		statusBlock,
+		ColorGray, duration.Round(100*time.Millisecond), ColorReset)
 
-	if err != "" {
-		fmt.Printf("      %sERROR: %s%s\n", ColorRed, err, ColorReset)
+	// Добавляем код ошибки если есть
+	if err != "" && status != "RUNNING" {
+		// Пытаемся извлечь exit code из ошибки
+		if strings.Contains(err, "Exit code:") {
+			fmt.Printf(" | Exit Code: %s%s%s", ColorRed, strings.TrimPrefix(err, "Exit code: "), ColorReset)
+		} else {
+			fmt.Printf(" | %sERROR: %s%s", ColorRed, err, ColorReset)
+		}
 	}
+
+	fmt.Println()
+}
+
+func printTestsSummary(results []TestResult, duration time.Duration) {
+	// Заголовок
+	fmt.Printf("\n%sTESTS SUMMARY%s\n", ColorWhite, ColorReset)
+	printThickSeparator()
+
+	// Подсчёт статусов
+	total := len(results)
+	passed, failed, skipped, timedOut := 0, 0, 0, 0
+	for _, r := range results {
+		switch r.Status {
+		case "PASSED":
+			passed++
+		case "FAILED":
+			failed++
+		case "SKIPPED":
+			skipped++
+		case "TIMEOUT":
+			timedOut++
+		}
+	}
+
+	// Отображение метрик
+	fmt.Printf("  %-15s: %s%4d%s\n", "Total Tests", ColorWhite, total, ColorReset)
+	fmt.Printf("  %-15s: %s%4d%s\n", "Passed", ColorGreen, passed, ColorReset)
+	fmt.Printf("  %-15s: %s%4d%s\n", "Failed", ColorRed, failed, ColorReset)
+	fmt.Printf("  %-15s: %s%4d%s\n", "Skipped", ColorYellow, skipped, ColorReset)
+	fmt.Printf("  %-15s: %s%4d%s\n", "Timed Out", ColorYellow, timedOut, ColorReset)
+
+	// Процент успешных
+	if total > 0 {
+		rate := (passed * 100) / total
+		rateColor := ColorRed
+		switch {
+		case rate == 100:
+			rateColor = ColorGreen
+		case rate >= 80:
+			rateColor = ColorYellow
+		}
+		fmt.Printf("  %-15s: %s%3d%%%s\n", "Success Rate", rateColor, rate, ColorReset)
+	}
+
+	// Время выполнения
+	fmt.Printf("  %-15s: %s%v%s\n", "Elapsed Time", ColorGray, duration.Round(time.Second), ColorReset)
+
+	// Разделитель перед списком
+	printThickSeparator()
+
+	// Список тестов, которые не прошли
+	if failed+timedOut > 0 {
+		fmt.Printf("\n%sNOT PASSED TESTS (%d)%s\n", ColorRed, failed+timedOut, ColorReset)
+		for _, r := range results {
+			if r.Status == "FAILED" || r.Status == "TIMEOUT" {
+				fmt.Printf("  - %s%s%s\n", ColorRed, r.Name, ColorReset)
+			}
+		}
+	} else {
+		fmt.Printf("\n%sALL TESTS PASSED%s\n", ColorGreen, ColorReset)
+	}
+
+	fmt.Println()
 }
 
 var outputManager = &OutputManager{}
 
 func printSectionHeader(title string) {
-	fmt.Printf("\n%s", ColorBlue)
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("  %s\n", title)
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("%s", ColorReset)
+	fmt.Printf("\n%s%s%s Hardware Validation System %sv%s%s\n",
+		ColorBlue, "FIRESTARTER", ColorReset, ColorGray, VERSION, ColorReset)
+	printThickSeparator()
+	fmt.Printf("\n%s%s%s\n", ColorWhite, strings.ToUpper(title), ColorReset)
 }
 
 func printSubHeader(title, subtitle string) {
-	fmt.Printf("\n%s--- %s ---%s\n", ColorBlue, title, ColorReset)
+	fmt.Printf("\n%s%s%s\n", ColorWhite, strings.ToUpper(title), ColorReset)
 	if subtitle != "" {
-		fmt.Printf("%s%s%s\n", ColorWhite, subtitle, ColorReset)
+		fmt.Printf("%s%s%s\n", ColorGray, subtitle, ColorReset)
+	}
+}
+
+// printExecutionSummary выводит сводку по сессии и затем детальный вывод всех упавших тестов
+func printExecutionSummary(allResults []TestResult, flashResults []FlashResult, totalDuration time.Duration) {
+	fmt.Printf("\n%sSESSION SUMMARY%s\n", ColorWhite, ColorReset)
+	printThickSeparator()
+
+	// Собираем статистику тестов
+	totalTests := len(allResults)
+	passedTests := 0
+	failedTests := 0
+	skippedTests := 0
+	timeoutTests := 0
+
+	for _, result := range allResults {
+		switch result.Status {
+		case "PASSED":
+			passedTests++
+		case "FAILED":
+			failedTests++
+		case "SKIPPED":
+			skippedTests++
+		case "TIMEOUT":
+			timeoutTests++
+		}
+	}
+
+	// Собираем статистику прошивки
+	totalFlash := len(flashResults)
+	successFlash := 0
+	failedFlash := 0
+	for _, fr := range flashResults {
+		if fr.Status == "SUCCESS" || fr.Status == "COMPLETED" || fr.Status == "PASSED" {
+			successFlash++
+		} else {
+			failedFlash++
+		}
+	}
+
+	// Выводим основные цифры
+	fmt.Printf("  Total Tests       : %s%d%s\n", ColorWhite, totalTests, ColorReset)
+	fmt.Printf("  Passed            : %s%d%s\n", ColorGreen, passedTests, ColorReset)
+	fmt.Printf("  Failed            : %s%d%s\n", ColorRed, failedTests, ColorReset)
+	fmt.Printf("  Skipped           : %s%d%s\n", ColorYellow, skippedTests, ColorReset)
+	fmt.Printf("  Timeout           : %s%d%s\n", ColorYellow, timeoutTests, ColorReset)
+	if totalTests > 0 {
+		successRate := (passedTests * 100) / totalTests
+		color := ColorRed
+		if successRate >= 100 {
+			color = ColorGreen
+		} else if successRate >= 80 {
+			color = ColorYellow
+		}
+		fmt.Printf("  Success Rate      : %s%d%%%s\n", color, successRate, ColorReset)
+	}
+
+	if totalFlash > 0 {
+		fmt.Printf("\n  Flash Operations  : %s%d Total%s\n", ColorWhite, totalFlash, ColorReset)
+		fmt.Printf("  Flash Success     : %s%d%s\n", ColorGreen, successFlash, ColorReset)
+		fmt.Printf("  Flash Failed      : %s%d%s\n", ColorRed, failedFlash, ColorReset)
+	}
+
+	fmt.Printf("\n  Total Duration    : %s%s%s\n", ColorGray, totalDuration.Round(time.Second), ColorReset)
+
+	// Определяем и выводим общий статус
+	sessionStatus := "SUCCESS"
+	if failedTests > 0 || failedFlash > 0 {
+		sessionStatus = "FAILED"
+	} else if skippedTests > 0 || timeoutTests > 0 {
+		sessionStatus = "PARTIAL"
+	}
+	fmt.Printf("  Session Status    : ")
+	switch sessionStatus {
+	case "SUCCESS":
+		fmt.Printf("%s SUCCESS %s\n", ColorBgGreen, ColorReset)
+	case "FAILED":
+		fmt.Printf("%s FAILED %s %s(issues detected)%s\n", ColorBgRed, ColorReset, ColorGray, ColorReset)
+	case "PARTIAL":
+		fmt.Printf("%s PARTIAL %s %s(some tests skipped)%s\n", ColorBgYellow, ColorReset, ColorGray, ColorReset)
+	}
+
+	// Если есть упавшие тесты — показываем их список
+	if failedTests > 0 {
+		fmt.Printf("\n%sCRITICAL ISSUES REQUIRING ATTENTION%s\n", ColorWhite, ColorReset)
+		printSeparator()
+		for _, result := range allResults {
+			if result.Status == "FAILED" || result.Status == "TIMEOUT" {
+				fmt.Printf("  %s%-20s%s %s\n", ColorRed, result.Name, ColorReset,
+					func() string {
+						if result.Error != "" {
+							return result.Error
+						}
+						return "Test execution failed"
+					}())
+			}
+		}
+
+		// А теперь детальный вывод всех упавших тестов
+		fmt.Println("\nDETAILS OF FAILED TESTS:")
+		printSeparator()
+		for _, result := range allResults {
+			if result.Status == "FAILED" || result.Status == "TIMEOUT" {
+				fmt.Printf("\n%s OUTPUT FOR %s:%s\n", ColorWhite, result.Name, ColorReset)
+				printSeparator()
+				fmt.Print(result.Output)
+				printSeparator()
+			}
+		}
 	}
 }
 
@@ -242,10 +469,6 @@ func printInfo(message string) {
 
 func printSuccess(message string) {
 	printColored(ColorGreen, message)
-}
-
-func printWarning(message string) {
-	printColored(ColorYellow, message)
 }
 
 func printError(message string) {
@@ -408,35 +631,34 @@ func executeTest(test TestSpec, globalTimeout string) (TestResult, string) {
 	return result, output
 }
 
+// runTest выполняет тест и возвращает результат, не выводя сразу секцию с полным выводом
 func runTest(test TestSpec, outputMgr *OutputManager, globalTimeout string) TestResult {
 	attempts := 0
-	maxAttempts := 5 // Prevent infinite loops
+	maxAttempts := 5
+
+	var result TestResult
+	var output string
 
 	for attempts < maxAttempts {
 		attempts++
-
-		// Print running status
 		outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
 
-		result, output := executeTest(test, globalTimeout)
+		result, output = executeTest(test, globalTimeout)
 		result.Attempts = attempts
+		result.Output = output
 
-		// Print output if test produced any
-		if output != "" {
+		outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
+
+		// Решаем, показывать ли полный вывод:
+		if output != "" && !(result.Status == "PASSED" && test.Collapse) {
 			outputMgr.PrintSection(test.Name+" Output", output)
 		}
 
-		// Print result
-		outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
-
-		// If test passed, return immediately
 		if result.Status == "PASSED" {
 			return result
 		}
 
-		// If test failed or timed out, ask user what to do (only in sequential mode)
 		action := askUserAction(test.Name)
-
 		switch action {
 		case "RETRY":
 			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts+1, ColorReset)
@@ -450,173 +672,214 @@ func runTest(test TestSpec, outputMgr *OutputManager, globalTimeout string) Test
 		}
 	}
 
-	// If we've reached max attempts, return the last result
+	// Если дошли до лимита попыток
 	fmt.Printf("%sMaximum retry attempts (%d) reached for test '%s'%s\n", ColorRed, maxAttempts, test.Name, ColorReset)
-	result, _ := executeTest(test, globalTimeout)
-	result.Attempts = attempts
-	return result
+	finalResult, finalOutput := executeTest(test, globalTimeout)
+	finalResult.Attempts = attempts
+	finalResult.Output = finalOutput
+
+	outputMgr.PrintResult(time.Now(), test.Name, finalResult.Status, finalResult.Duration, finalResult.Error)
+	if finalOutput != "" && !(finalResult.Status == "PASSED" && test.Collapse) {
+		outputMgr.PrintSection(test.Name+" Output", finalOutput)
+	}
+	return finalResult
 }
 
+// runParallelTestsWithRetries выполняет набор тестов параллельно, а потом последовательно обрабатывает упавшие,
+// показывая при этом сразу причину и вывод для каждого неудачного теста.
 func runParallelTestsWithRetries(tests []TestSpec, outputMgr *OutputManager, globalTimeout string) []TestResult {
 	results := make([]TestResult, len(tests))
 	finalResults := make([]TestResult, len(tests))
 
-	// First run: execute all tests in parallel
+	// --- Параллельный запуск ---
 	var wg sync.WaitGroup
-	for i, test := range tests {
+	for i, t := range tests {
 		wg.Add(1)
-		go func(idx int, t TestSpec) {
+		go func(idx int, test TestSpec) {
 			defer wg.Done()
 
-			// Print running status
-			outputMgr.PrintResult(time.Now(), t.Name, "RUNNING", 0, "")
+			outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
+			res, out := executeTest(test, globalTimeout)
+			res.Attempts = 1
+			res.Output = out
 
-			// Execute test once without retry prompts
-			result, output := executeTest(t, globalTimeout)
-			result.Attempts = 1
-
-			// Print output if test produced any
-			if output != "" {
-				outputMgr.PrintSection(t.Name+" Output", output)
+			outputMgr.PrintResult(time.Now(), test.Name, res.Status, res.Duration, res.Error)
+			if out != "" && !(res.Status == "PASSED" && test.Collapse) {
+				outputMgr.PrintSection(test.Name+" Output", out)
 			}
 
-			// Print result
-			outputMgr.PrintResult(time.Now(), t.Name, result.Status, result.Duration, result.Error)
-
-			results[idx] = result
-		}(i, test)
+			results[idx] = res
+		}(i, t)
 	}
-
-	// Wait for all parallel tests to complete
 	wg.Wait()
 
-	// Count failed tests that need attention
+	// --- Подсчитываем упавшие ---
 	failedCount := 0
-	for _, result := range results {
-		if result.Status == "FAILED" || result.Status == "TIMEOUT" {
+	for _, r := range results {
+		if r.Status == "FAILED" || r.Status == "TIMEOUT" {
 			failedCount++
 		}
 	}
-
 	if failedCount > 0 {
-		fmt.Printf("\n%s%s%s\n", ColorYellow, strings.Repeat("=", 80), ColorReset)
-		fmt.Printf("%s  PARALLEL EXECUTION COMPLETED - PROCESSING %d FAILED TEST(S)%s\n", ColorYellow, failedCount, ColorReset)
-		fmt.Printf("%s%s%s\n", ColorYellow, strings.Repeat("=", 80), ColorReset)
+		fmt.Printf("\n%sParallel complete: %d failed test(s)%s\n", ColorYellow, failedCount, ColorReset)
 	} else {
-		fmt.Printf("\n%sAll parallel tests completed successfully!%s\n", ColorGreen, ColorReset)
+		fmt.Printf("\n%sAll parallel tests passed%s\n", ColorGreen, ColorReset)
 	}
 
-	// Second phase: handle failed tests sequentially with retry prompts
-	processedCount := 0
-	for i, result := range results {
-		if result.Status == "PASSED" {
-			finalResults[i] = result
+	// --- Последовательная доработка упавших ---
+	proc := 0
+	for i, r := range results {
+		if r.Status == "PASSED" {
+			finalResults[i] = r
 			continue
 		}
+		proc++
+		if proc > 1 {
+			fmt.Println()
+		}
+		fmt.Printf("%sProcessing failed test %d/%d: %s%s\n",
+			ColorBlue, proc, failedCount, tests[i].Name, ColorReset)
 
-		processedCount++
-		if processedCount > 1 {
-			fmt.Printf("\n%s%s%s\n", ColorBlue, strings.Repeat("-", 40), ColorReset)
+		// Всегда показываем причину и вывод перед retry/skip
+		fmt.Printf("  Status: %s%s%s\n", ColorRed, r.Status, ColorReset)
+		if r.Error != "" {
+			fmt.Printf("  Error : %s\n", r.Error)
+		}
+		if r.Output != "" {
+			outputMgr.PrintSection(tests[i].Name+" Output", r.Output)
 		}
 
-		// This test failed, ask for retry
-		test := tests[i]
-		fmt.Printf("\n%sProcessing failed test %d of %d: %s%s\n", ColorBlue, processedCount, failedCount, test.Name, ColorReset)
-		finalResults[i] = handleFailedTestWithRetries(test, result, outputMgr, globalTimeout)
+		finalResults[i] = handleFailedTestWithRetries(tests[i], r, outputMgr, globalTimeout)
 	}
 
 	return finalResults
 }
 
+// handleFailedTestWithRetries предлагает retry/skip/continue до 5 раз
 func handleFailedTestWithRetries(test TestSpec, initialResult TestResult, outputMgr *OutputManager, globalTimeout string) TestResult {
 	currentResult := initialResult
-	attempts := 1
+	attempts := initialResult.Attempts
 	maxAttempts := 5
 
-	for attempts < maxAttempts {
-		if currentResult.Status == "PASSED" {
-			break
-		}
-
-		// Ask user what to do with this failed test
+	for attempts < maxAttempts && currentResult.Status != "PASSED" {
 		action := askUserAction(test.Name)
-
 		switch action {
 		case "RETRY":
 			attempts++
 			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts, ColorReset)
-
-			// Print running status
 			outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
-
-			// Execute test again
 			result, output := executeTest(test, globalTimeout)
 			result.Attempts = attempts
-
-			// Print output if test produced any
-			if output != "" {
-				outputMgr.PrintSection(test.Name+" Output", output)
-			}
-
-			// Print result
+			result.Output = output
 			outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
-
 			currentResult = result
-
 		case "SKIP":
 			currentResult.Status = "SKIPPED"
 			currentResult.Error = "Skipped by operator"
-			currentResult.Attempts = attempts
 			outputMgr.PrintResult(time.Now(), test.Name, currentResult.Status, currentResult.Duration, currentResult.Error)
 			return currentResult
-
 		case "CONTINUE":
-			currentResult.Attempts = attempts
 			return currentResult
 		}
 	}
 
-	// If we've reached max attempts, return the last result
 	if attempts >= maxAttempts && currentResult.Status != "PASSED" {
 		fmt.Printf("%sMaximum retry attempts (%d) reached for test '%s'%s\n", ColorRed, maxAttempts, test.Name, ColorReset)
 	}
 
-	currentResult.Attempts = attempts
 	return currentResult
 }
 
 func runTestGroup(tests []TestSpec, parallel bool, outputMgr *OutputManager, groupName, globalTimeout string) []TestResult {
-	printSectionHeader(fmt.Sprintf("EXECUTING %s", strings.ToUpper(groupName)))
-	fmt.Printf("Mode: %s | Tests: %d | Timeout: %s\n",
-		func() string {
-			if parallel {
-				return "Parallel"
-			} else {
-				return "Sequential"
-			}
-		}(),
-		len(tests),
-		func() string {
+	fmt.Printf("\n%s%s%s\n", ColorWhite, strings.ToUpper(groupName), ColorReset)
+
+	mode := "Sequential"
+	if parallel {
+		mode = "Parallel"
+	}
+
+	fmt.Printf("Mode: %s%s%s | Tests: %s%d%s | Timeout: %s%s%s\n",
+		ColorCyan, mode, ColorReset,
+		ColorGreen, len(tests), ColorReset,
+		ColorYellow, func() string {
 			if globalTimeout != "" {
 				return globalTimeout
-			} else {
-				return "30s (default)"
 			}
-		}())
-	fmt.Println(strings.Repeat("-", 80))
+			return "30s (default)"
+		}(), ColorReset)
 
+	printSeparator()
+
+	var results []TestResult
 	if parallel {
-		// Run tests in parallel, but handle retries sequentially after all tests complete
-		return runParallelTestsWithRetries(tests, outputMgr, globalTimeout)
+		results = runParallelTestsWithRetries(tests, outputMgr, globalTimeout)
 	} else {
-		// Run tests sequentially with immediate retry prompts
-		var results []TestResult
-		for _, test := range tests {
-			result := runTest(test, outputMgr, globalTimeout)
-			results = append(results, result)
+		results = make([]TestResult, len(tests))
+		for i, test := range tests {
+			results[i] = runTest(test, outputMgr, globalTimeout)
 		}
-		return results
 	}
+
+	// Выводим сводку группы в enterprise стиле
+	fmt.Printf("\n%sGROUP RESULTS%s\n", ColorWhite, ColorReset)
+	printSeparator()
+
+	passed := 0
+	failed := 0
+	skipped := 0
+
+	var passedTests []string
+	var failedTests []string
+	var skippedTests []string
+
+	for _, result := range results {
+		switch result.Status {
+		case "PASSED":
+			passed++
+			passedTests = append(passedTests, result.Name)
+		case "FAILED", "TIMEOUT":
+			failed++
+			failedTests = append(failedTests, result.Name)
+		case "SKIPPED":
+			skipped++
+			skippedTests = append(skippedTests, result.Name)
+		}
+	}
+
+	// Определяем статус группы
+	groupStatus := "PASSED"
+	if failed > 0 {
+		groupStatus = "FAILED"
+	} else if skipped > 0 {
+		groupStatus = "PARTIAL"
+	}
+
+	// Выводим статистику
+	fmt.Printf("  %s%-20s%s: ", ColorWhite, groupName, ColorReset)
+	switch groupStatus {
+	case "PASSED":
+		fmt.Printf("%s PASSED %s", ColorBgGreen, ColorReset)
+	case "FAILED":
+		fmt.Printf("%s FAILED %s %s(%d of %d tests failed)%s",
+			ColorBgRed, ColorReset, ColorGray, failed, len(tests), ColorReset)
+	case "PARTIAL":
+		fmt.Printf("%s PARTIAL %s %s(%d passed, %d skipped)%s",
+			ColorBgYellow, ColorReset, ColorGray, passed, skipped, ColorReset)
+	}
+	fmt.Println()
+
+	// Выводим списки тестов
+	if len(passedTests) > 0 {
+		fmt.Printf("  %sPassed:%s %s\n", ColorGreen, ColorReset, strings.Join(passedTests, ", "))
+	}
+	if len(failedTests) > 0 {
+		fmt.Printf("  %sFailed:%s %s\n", ColorRed, ColorReset, strings.Join(failedTests, ", "))
+	}
+	if len(skippedTests) > 0 {
+		fmt.Printf("  %sSkipped:%s %s\n", ColorYellow, ColorReset, strings.Join(skippedTests, ", "))
+	}
+
+	return results
 }
 
 func getFlashData(config FlashConfig, productName string) (*FlashData, error) {
@@ -1996,30 +2259,32 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 }
 
 func main() {
-	// Parse command line arguments
-	args := os.Args[1:]
+	var configPath string
+	var showVersion bool
+	var testsOnly bool
+	var flashOnly bool
+	var show_Help bool
 
-	var configPath = "config.yaml"
-	var testsOnly, flashOnly bool
+	flag.StringVar(&configPath, "c", "config.yaml", "Path to configuration file")
+	flag.BoolVar(&showVersion, "V", false, "Show version")
+	flag.BoolVar(&testsOnly, "tests-only", false, "Run only tests (skip flashing)")
+	flag.BoolVar(&flashOnly, "flash-only", false, "Run only flashing (skip tests)")
+	flag.BoolVar(&show_Help, "h", false, "Show help")
+	flag.Parse()
 
-	for i, arg := range args {
-		switch arg {
-		case "-V":
-			fmt.Println(VERSION)
-			return
-		case "-h":
-			showHelp()
-			return
-		case "-c":
-			if i+1 < len(args) {
-				configPath = args[i+1]
-			}
-		case "-tests-only":
-			testsOnly = true
-		case "-flash-only":
-			flashOnly = true
-		}
+	if show_Help {
+		showHelp()
+		os.Exit(0)
 	}
+	if showVersion {
+		fmt.Printf("FIRESTARTER v%s\n", VERSION)
+		os.Exit(0)
+	}
+
+	// Enterprise заголовок
+	fmt.Printf("%sFIRESTARTER%s Hardware Validation System %sv%s%s\n",
+		ColorBlue, ColorReset, ColorGray, VERSION, ColorReset)
+	printThickSeparator()
 
 	// Load configuration
 	config, err := loadConfig(configPath)
@@ -2027,64 +2292,54 @@ func main() {
 		printError(fmt.Sprintf("Failed to load configuration: %v", err))
 		os.Exit(1)
 	}
-
-	// Check root privileges if required
 	if config.System.RequireRoot && os.Geteuid() != 0 {
 		printError("This program requires root privileges")
 		os.Exit(1)
 	}
 
-	// Print header
-	fmt.Printf("\n%s", ColorBlue)
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("  SYSTEM VALIDATOR v%s\n", VERSION)
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("%s", ColorReset)
-	fmt.Printf("Product: %s%s%s | Config: %s%s%s\n",
-		ColorGreen, config.System.Product, ColorReset,
-		ColorYellow, configPath, ColorReset)
-	fmt.Printf("Root Required: %s%v%s | Driver Dir: %s%s%s\n",
-		ColorYellow, config.System.RequireRoot, ColorReset,
-		ColorBlue, config.System.DriverDir, ColorReset)
+	// System configuration display
+	fmt.Printf("\n%sSYSTEM CONFIGURATION%s\n", ColorWhite, ColorReset)
+	fmt.Printf("  Target Product    : %s%s%s\n", ColorCyan, config.System.Product, ColorReset)
+	fmt.Printf("  Configuration     : %s%s%s\n", ColorYellow, configPath, ColorReset)
+	fmt.Printf("  Root Required     : %s%v%s\n", ColorYellow, config.System.RequireRoot, ColorReset)
+	fmt.Printf("  Driver Directory  : %s%s%s\n", ColorBlue, config.System.DriverDir, ColorReset)
 
-	startTime := time.Now()
+	sessionStart := time.Now()
 
-	// Get system information
-	printSubHeader("SYSTEM DETECTION", "Gathering hardware and network information")
+	// System identification
+	fmt.Printf("\n%sSYSTEM IDENTIFICATION%s\n", ColorWhite, ColorReset)
+	printSeparator()
 	systemInfo, err := getSystemInfo()
 	if err != nil {
 		printError(fmt.Sprintf("Failed to get system information: %v", err))
 		os.Exit(1)
 	}
+	fmt.Printf("  Product Name      : %s%s%s\n", ColorCyan, systemInfo.Product, ColorReset)
+	fmt.Printf("  Board Serial      : %s%s%s\n", ColorCyan, systemInfo.MBSerial, ColorReset)
+	fmt.Printf("  Network Address   : %s%s%s\n", ColorCyan, systemInfo.IP, ColorReset)
+	fmt.Printf("  Detection Time    : %s%s%s\n", ColorGray, systemInfo.Timestamp.Format("2006-01-02 15:04:05"), ColorReset)
 
-	fmt.Printf("Detected Product: %s%s%s\n", ColorGreen, systemInfo.Product, ColorReset)
-	fmt.Printf("Board Serial: %s%s%s\n", ColorGreen, systemInfo.MBSerial, ColorReset)
-	fmt.Printf("IP Address: %s%s%s\n", ColorGreen, systemInfo.IP, ColorReset)
-	fmt.Printf("Detection Time: %s%s%s\n", ColorBlue, systemInfo.Timestamp.Format("2006-01-02 15:04:05"), ColorReset)
-
-	// Check product compatibility
+	// Product compatibility check
 	if config.System.Product != "" && systemInfo.Product != "" {
 		if config.System.Product != systemInfo.Product {
 			if askUserProductMismatch(config.System.Product, systemInfo.Product) {
 				printInfo("Program terminated by user due to product mismatch")
 				os.Exit(0)
-			} else {
-				printWarning("Continuing with mismatched product configuration")
-				printWarning("Use at your own risk!")
 			}
+			fmt.Printf("  Configuration     : %sWARNING - Product mismatch%s\n", ColorYellow, ColorReset)
 		} else {
-			printSuccess("Product configuration matches detected hardware")
+			fmt.Printf("  Configuration     : %sCompatible%s\n", ColorGreen, ColorReset)
 		}
 	} else {
 		if config.System.Product == "" {
-			printWarning("No product specified in configuration")
+			fmt.Printf("  Configuration     : %sNo product specified in config%s\n", ColorYellow, ColorReset)
 		}
 		if systemInfo.Product == "" {
-			printWarning("Could not detect system product name")
+			fmt.Printf("  Configuration     : %sCould not detect system product%s\n", ColorYellow, ColorReset)
 		}
 	}
 
-	// Test server connection early if log sending is enabled
+	// Test server connection
 	if config.Log.SendLogs {
 		if err := testServerConnection(config.Log); err != nil {
 			printError(fmt.Sprintf("Server connection test failed: %v", err))
@@ -2097,44 +2352,59 @@ func main() {
 	var flashResults []FlashResult
 	var flashData *FlashData
 
-	// Run tests
+	// TESTING PHASE [1/2]
 	if !flashOnly {
-		printSectionHeader("TESTING PHASE [1/2]")
+		fmt.Printf("\n%sTESTING PHASE [1/2]%s\n", ColorWhite, ColorReset)
+		printThickSeparator()
 
+		// Count tests
 		totalTests := 0
-		for _, group := range config.Tests.ParallelGroups {
-			totalTests += len(group)
+		for _, g := range config.Tests.ParallelGroups {
+			totalTests += len(g)
 		}
-		for _, group := range config.Tests.SequentialGroups {
-			totalTests += len(group)
+		for _, g := range config.Tests.SequentialGroups {
+			totalTests += len(g)
 		}
-
 		fmt.Printf("Total Tests: %s%d%s | Global Timeout: %s%s%s\n",
 			ColorGreen, totalTests, ColorReset,
 			ColorYellow, func() string {
 				if config.Tests.Timeout != "" {
 					return config.Tests.Timeout
-				} else {
-					return "30s (default)"
 				}
+				return "30s (default)"
 			}(), ColorReset)
 
-		// Run parallel groups
-		for i, group := range config.Tests.ParallelGroups {
+		// Run tests
+		testsStart := time.Now()
+		for i, g := range config.Tests.ParallelGroups {
 			groupName := fmt.Sprintf("Parallel Group %d", i+1)
-			results := runTestGroup(group, true, outputManager, groupName, config.Tests.Timeout)
+			results := runTestGroup(g, true, outputManager, groupName, config.Tests.Timeout)
 			allResults = append(allResults, results...)
 		}
-
-		// Run sequential groups
-		for i, group := range config.Tests.SequentialGroups {
+		for i, g := range config.Tests.SequentialGroups {
 			groupName := fmt.Sprintf("Sequential Group %d", i+1)
-			results := runTestGroup(group, false, outputManager, groupName, config.Tests.Timeout)
+			results := runTestGroup(g, false, outputManager, groupName, config.Tests.Timeout)
 			allResults = append(allResults, results...)
+		}
+		testsDuration := time.Since(testsStart)
+
+		// Tests summary
+		printTestsSummary(allResults, testsDuration)
+
+		// List failed tests by name
+		var failedNames []string
+		for _, r := range allResults {
+			if r.Status == "FAILED" || r.Status == "TIMEOUT" {
+				failedNames = append(failedNames, r.Name)
+			}
+		}
+		if len(failedNames) > 0 {
+			fmt.Printf("%sFailed tests:%s %s\n\n",
+				ColorRed, ColorReset, strings.Join(failedNames, ", "))
 		}
 	}
 
-	// Get flash data from user input (if flashing is enabled)
+	// FLASH data input
 	if !testsOnly && config.Flash.Enabled {
 		flashData, err = getFlashData(config.Flash, systemInfo.Product)
 		if err != nil {
@@ -2143,44 +2413,36 @@ func main() {
 		}
 	}
 
-	// Run flashing
+	// FLASHING PHASE [2/2]
 	if !testsOnly && config.Flash.Enabled && flashData != nil {
-		printSectionHeader("FLASHING PHASE [2/2]")
+		fmt.Printf("\n%sFLASHING PHASE [2/2]%s\n", ColorWhite, ColorReset)
+		printThickSeparator()
 		fmt.Printf("Operations: %s%s%s | Method: %s%s%s\n",
 			ColorYellow, strings.Join(config.Flash.Operations, ", "), ColorReset,
 			ColorGreen, config.Flash.Method, ColorReset)
 		flashResults = runFlashing(config.Flash, flashData, config.System)
 	}
 
-	totalDuration := time.Since(startTime)
+	// Session duration
+	totalDuration := time.Since(sessionStart)
 
-	// Create session log
+	// Save & send logs
 	sessionLog := SessionLog{
-		SessionID: fmt.Sprintf("%d", time.Now().Unix()),
-		Timestamp: startTime,
-		System:    systemInfo,
-		Pipeline: PipelineInfo{
-			Mode:     "full",
-			Config:   configPath,
-			Duration: totalDuration,
-			Operator: config.Log.OpName,
-		},
+		SessionID:    fmt.Sprintf("%d", time.Now().Unix()),
+		Timestamp:    sessionStart,
+		System:       systemInfo,
+		Pipeline:     PipelineInfo{Mode: "full", Config: configPath, Duration: totalDuration, Operator: config.Log.OpName},
 		TestResults:  allResults,
 		FlashResults: flashResults,
 	}
-
-	// Add flash data to system info if available
 	if flashData != nil {
 		sessionLog.System.MBSerial = flashData.SystemSerial
 		sessionLog.System.IOSerial = flashData.IOBoard
 		sessionLog.System.MAC = flashData.MAC
 	}
-
-	// Save and send logs
 	if err := saveLog(sessionLog, config.Log); err != nil {
 		printError(fmt.Sprintf("Failed to save log: %v", err))
 	}
-
 	if config.Log.SendLogs {
 		if err := sendLogToServer(sessionLog, config.Log); err != nil {
 			printError(fmt.Sprintf("Failed to send log to server: %v", err))
@@ -2189,78 +2451,26 @@ func main() {
 		printInfo("Log sending disabled (send_logs: false)")
 	}
 
-	// Print summary
-	printSectionHeader("EXECUTION SUMMARY")
+	// Final summary
+	printExecutionSummary(allResults, flashResults, totalDuration)
 
-	passed := 0
-	failed := 0
-	skipped := 0
-	timeouts := 0
-	required_failed := 0
-
-	for _, result := range allResults {
-		switch result.Status {
-		case "PASSED":
-			passed++
-		case "FAILED":
-			failed++
-			if result.Required {
-				required_failed++
-			}
-		case "SKIPPED":
-			skipped++
-		case "TIMEOUT":
-			timeouts++
-			if result.Required {
-				required_failed++
-			}
+	// Exit code
+	exitCode := 0
+	for _, r := range allResults {
+		if r.Status == "FAILED" && r.Required {
+			exitCode = 1
+			break
 		}
 	}
-
-	fmt.Printf("Execution Time: %s%s%s\n", ColorBlue, totalDuration.Round(100*time.Millisecond), ColorReset)
-	fmt.Printf("Total Tests: %s%d%s\n", ColorWhite, len(allResults), ColorReset)
-	fmt.Printf("  %sPassed: %d%s\n", ColorGreen, passed, ColorReset)
-	if failed > 0 {
-		fmt.Printf("  %sFailed: %d%s\n", ColorRed, failed, ColorReset)
-	}
-	if timeouts > 0 {
-		fmt.Printf("  %sTimeouts: %d%s\n", ColorYellow, timeouts, ColorReset)
-	}
-	if skipped > 0 {
-		fmt.Printf("  %sSkipped: %d%s\n", ColorBlue, skipped, ColorReset)
-	}
-
-	if required_failed > 0 {
-		fmt.Printf("\n%sRequired tests failed: %d%s\n", ColorRed, required_failed, ColorReset)
-		fmt.Printf("%sSYSTEM VALIDATION: FAILED%s\n", ColorRed, ColorReset)
-	} else if failed > 0 || timeouts > 0 {
-		fmt.Printf("\n%sOptional tests failed, but all required tests passed%s\n", ColorYellow, ColorReset)
-		fmt.Printf("%sSYSTEM VALIDATION: PASSED%s\n", ColorGreen, ColorReset)
-	} else {
-		fmt.Printf("\n%sAll tests completed successfully%s\n", ColorGreen, ColorReset)
-		fmt.Printf("%sSYSTEM VALIDATION: PASSED%s\n", ColorGreen, ColorReset)
-	}
-
-	// Flash summary
-	if len(flashResults) > 0 {
-		fmt.Printf("\nFlash Operations: %s%d%s\n", ColorWhite, len(flashResults), ColorReset)
-		flashPassed := 0
-		flashFailed := 0
-		for _, result := range flashResults {
-			if result.Status == "PASSED" {
-				flashPassed++
-			} else {
-				flashFailed++
-			}
-		}
-		fmt.Printf("  %sPassed: %d%s\n", ColorGreen, flashPassed, ColorReset)
-		if flashFailed > 0 {
-			fmt.Printf("  %sFailed: %d%s\n", ColorRed, flashFailed, ColorReset)
+	for _, fr := range flashResults {
+		if fr.Status == "FAILED" {
+			exitCode = 1
+			break
 		}
 	}
-
-	// Exit with error if required tests failed
-	if required_failed > 0 {
-		os.Exit(1)
+	if exitCode != 0 {
+		fmt.Printf("\n%sExiting with error code %d due to failed critical operations%s\n",
+			ColorRed, exitCode, ColorReset)
 	}
+	os.Exit(exitCode)
 }
