@@ -43,7 +43,7 @@ tests:
         args: ["-vis", "-c", ".data/fan_config.json"]
         type: "standard" 
         timeout: "30s"
-        collapse: false
+        collapse: true
         required: true
 
   # Последовательные группы тестов (выполняются по очереди)
