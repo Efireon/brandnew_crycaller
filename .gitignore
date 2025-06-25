@@ -5,5 +5,4 @@ bin/*
 test/*
 
 # Временный порт старого кода
-deprecated/stefi_old/eeupdate/*
-deprecated/stefi_old/rtnicpg/*
+deprecated/*
