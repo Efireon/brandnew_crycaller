@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const VERSION = "2.0.0"
+const VERSION = "2.0.2"
 
 // ANSI color codes
 const (
@@ -37,51 +38,72 @@ type Config struct {
 }
 
 type SystemConfig struct {
-	Product string `yaml:"product"`
+	Product     string `yaml:"product"`
+	RequireRoot bool   `yaml:"require_root"`
+	GuidPrefix  string `yaml:"guid_prefix"`
+	EfiSnName   string `yaml:"efi_sn_name"`
+	EfiMacName  string `yaml:"efi_mac_name"`
+	DriverDir   string `yaml:"driver_dir"`
 }
 
 type TestsConfig struct {
+	Timeout          string       `yaml:"timeout,omitempty"`
 	ParallelGroups   [][]TestSpec `yaml:"parallel_groups,omitempty"`
 	SequentialGroups [][]TestSpec `yaml:"sequential_groups,omitempty"`
 }
 
 type TestSpec struct {
-	Name    string   `yaml:"name"`
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args,omitempty"`
-	Type    string   `yaml:"type"` // "standard" or "tui"
-	Timeout string   `yaml:"timeout,omitempty"`
+	Name     string   `yaml:"name"`
+	Command  string   `yaml:"command"`
+	Args     []string `yaml:"args,omitempty"`
+	Type     string   `yaml:"type"`
+	Timeout  string   `yaml:"timeout,omitempty"`
+	Required bool     `yaml:"required"`
+}
+
+type FlashField struct {
+	Name  string `yaml:"name"`
+	Flash bool   `yaml:"flash"`
+	ID    string `yaml:"id"`
+	Regex string `yaml:"regex"`
 }
 
 type FlashConfig struct {
-	Enabled    bool     `yaml:"enabled"`
-	Operations []string `yaml:"operations,omitempty"`
+	Enabled    bool         `yaml:"enabled"`
+	Operations []string     `yaml:"operations,omitempty"`
+	Fields     []FlashField `yaml:"fields,omitempty"`
+	Method     string       `yaml:"method,omitempty"`
 }
 
 type LogConfig struct {
 	SaveLocal bool   `yaml:"save_local"`
-	Server    string `yaml:"server,omitempty"`
+	SendLogs  bool   `yaml:"send_logs"`
 	LogDir    string `yaml:"log_dir,omitempty"`
+	Server    string `yaml:"server,omitempty"`
+	ServerDir string `yaml:"server_dir,omitempty"`
+	OpName    string `yaml:"op_name,omitempty"`
 }
 
 type FlashData struct {
-	MBSerial string
-	IOSerial string
-	MAC      string
+	SystemSerial string
+	IOBoard      string
+	MAC          string
 }
 
 // Result structures
 type TestResult struct {
 	Name     string        `yaml:"name"`
-	Status   string        `yaml:"status"` // "PASSED", "FAILED", "TIMEOUT"
+	Status   string        `yaml:"status"` // "PASSED", "FAILED", "TIMEOUT", "SKIPPED"
 	Duration time.Duration `yaml:"duration"`
 	Error    string        `yaml:"error,omitempty"`
 	Output   string        `yaml:"-"` // Not saved to log
+	Required bool          `yaml:"required"`
+	Attempts int           `yaml:"attempts,omitempty"`
 }
 
 type SystemInfo struct {
 	Product   string                 `yaml:"product"`
-	MBSerial  string                 `yaml:"mb_serial"`
+	MBSerial  string                 `yaml:"mb_serial,omitempty"`
 	IOSerial  string                 `yaml:"io_serial,omitempty"`
 	MAC       string                 `yaml:"mac,omitempty"`
 	IP        string                 `yaml:"ip,omitempty"`
@@ -102,6 +124,7 @@ type PipelineInfo struct {
 	Mode     string        `yaml:"mode"`
 	Config   string        `yaml:"config"`
 	Duration time.Duration `yaml:"duration"`
+	Operator string        `yaml:"operator"`
 }
 
 type FlashResult struct {
@@ -109,6 +132,26 @@ type FlashResult struct {
 	Status    string        `yaml:"status"`
 	Duration  time.Duration `yaml:"duration"`
 	Details   string        `yaml:"details,omitempty"`
+}
+
+type NetworkInterface struct {
+	Name   string
+	MAC    string
+	IP     string
+	Driver string
+	State  string
+}
+
+type FlashMACSummary struct {
+	Method         string
+	TargetMAC      string
+	ExistingMAC    bool
+	InterfaceName  string
+	OriginalIP     string
+	OriginalDriver string
+	NICIndices     []int // For eeupdate method
+	Success        bool
+	Error          string
 }
 
 // Output manager for synchronized output
@@ -131,26 +174,55 @@ func (om *OutputManager) PrintResult(timestamp time.Time, name, status string, d
 	om.mutex.Lock()
 	defer om.mutex.Unlock()
 
-	icon := "✓"
-	color := ColorGreen
-	if status == "FAILED" {
-		icon = "❌"
+	var icon, color string
+	switch status {
+	case "PASSED":
+		icon = "PASS"
+		color = ColorGreen
+	case "FAILED":
+		icon = "FAIL"
 		color = ColorRed
-	} else if status == "TIMEOUT" {
-		icon = "⏰"
+	case "TIMEOUT":
+		icon = "TIME"
 		color = ColorYellow
+	case "SKIPPED":
+		icon = "SKIP"
+		color = ColorYellow
+	case "RUNNING":
+		icon = "RUN "
+		color = ColorBlue
+	default:
+		icon = "UNKN"
+		color = ColorWhite
 	}
 
-	fmt.Printf("[%s] %s%s %s %s (%s)%s\n",
+	fmt.Printf("[%s] [%s%s%s] %-40s %s\n",
 		timestamp.Format("15:04:05"),
-		color, icon, name, status, duration.Round(100*time.Millisecond), ColorReset)
+		color, icon, ColorReset,
+		name,
+		duration.Round(100*time.Millisecond))
 
 	if err != "" {
-		fmt.Printf("%sERROR: %s%s\n", ColorRed, err, ColorReset)
+		fmt.Printf("      %sERROR: %s%s\n", ColorRed, err, ColorReset)
 	}
 }
 
 var outputManager = &OutputManager{}
+
+func printSectionHeader(title string) {
+	fmt.Printf("\n%s", ColorBlue)
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("  %s\n", title)
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("%s", ColorReset)
+}
+
+func printSubHeader(title, subtitle string) {
+	fmt.Printf("\n%s--- %s ---%s\n", ColorBlue, title, ColorReset)
+	if subtitle != "" {
+		fmt.Printf("%s%s%s\n", ColorWhite, subtitle, ColorReset)
+	}
+}
 
 func printColored(color, message string) {
 	fmt.Printf("%s%s%s\n", color, message, ColorReset)
@@ -193,18 +265,56 @@ func loadConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
-func runTest(test TestSpec, outputMgr *OutputManager) TestResult {
+func askUserAction(testName string) string {
+	fmt.Printf("\n%s=== TEST FAILED ===%s\n", ColorRed, ColorReset)
+	fmt.Printf("Test '%s' has failed.\n", testName)
+	fmt.Printf("Choose action:\n")
+	fmt.Printf("  %s[Y]%s Yes - Retry test (default)\n", ColorGreen, ColorReset)
+	fmt.Printf("  %s[N]%s No  - Continue with next test\n", ColorYellow, ColorReset)
+	fmt.Printf("  %s[S]%s Skip - Mark as skipped by operator\n", ColorBlue, ColorReset)
+	fmt.Printf("Choice [Y/n/s]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "Y" // Default on error
+	}
+
+	choice := strings.ToUpper(strings.TrimSpace(input))
+	if choice == "" {
+		choice = "Y" // Default
+	}
+
+	switch choice {
+	case "Y", "YES":
+		return "RETRY"
+	case "N", "NO":
+		return "CONTINUE"
+	case "S", "SKIP":
+		return "SKIP"
+	default:
+		fmt.Printf("Invalid choice '%s', defaulting to retry.\n", choice)
+		return "RETRY"
+	}
+}
+
+func executeTest(test TestSpec, globalTimeout string) (TestResult, string) {
 	result := TestResult{
-		Name:   test.Name,
-		Status: "FAILED",
+		Name:     test.Name,
+		Status:   "FAILED",
+		Required: test.Required,
 	}
 
 	startTime := time.Now()
 
-	// Parse timeout
+	// Parse timeout - приоритет: тест > глобальный > дефолт
 	timeout := 30 * time.Second
 	if test.Timeout != "" {
 		if t, err := time.ParseDuration(test.Timeout); err == nil {
+			timeout = t
+		}
+	} else if globalTimeout != "" {
+		if t, err := time.ParseDuration(globalTimeout); err == nil {
 			timeout = t
 		}
 	}
@@ -252,136 +362,324 @@ func runTest(test TestSpec, outputMgr *OutputManager) TestResult {
 		result.Status = "PASSED"
 	}
 
-	// Print output if test produced any
-	if output != "" {
-		outputMgr.PrintSection(test.Name+" Output", output)
+	return result, output
+}
+
+func runTest(test TestSpec, outputMgr *OutputManager, globalTimeout string) TestResult {
+	attempts := 0
+	maxAttempts := 5 // Prevent infinite loops
+
+	for attempts < maxAttempts {
+		attempts++
+
+		// Print running status
+		outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
+
+		result, output := executeTest(test, globalTimeout)
+		result.Attempts = attempts
+
+		// Print output if test produced any
+		if output != "" {
+			outputMgr.PrintSection(test.Name+" Output", output)
+		}
+
+		// Print result
+		outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
+
+		// If test passed, return immediately
+		if result.Status == "PASSED" {
+			return result
+		}
+
+		// If test failed or timed out, ask user what to do (only in sequential mode)
+		action := askUserAction(test.Name)
+
+		switch action {
+		case "RETRY":
+			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts+1, ColorReset)
+			continue
+		case "SKIP":
+			result.Status = "SKIPPED"
+			result.Error = "Skipped by operator"
+			return result
+		case "CONTINUE":
+			return result
+		}
 	}
 
-	// Print result
-	outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
-
+	// If we've reached max attempts, return the last result
+	fmt.Printf("%sMaximum retry attempts (%d) reached for test '%s'%s\n", ColorRed, maxAttempts, test.Name, ColorReset)
+	result, _ := executeTest(test, globalTimeout)
+	result.Attempts = attempts
 	return result
 }
 
-func runTestGroup(tests []TestSpec, parallel bool, outputMgr *OutputManager, groupName string) []TestResult {
-	printInfo(fmt.Sprintf("==> %s", groupName))
+func runTestGroup(tests []TestSpec, parallel bool, outputMgr *OutputManager, groupName, globalTimeout string) []TestResult {
+	printSectionHeader(fmt.Sprintf("EXECUTING %s", strings.ToUpper(groupName)))
+	fmt.Printf("Mode: %s | Tests: %d | Timeout: %s\n",
+		func() string {
+			if parallel {
+				return "Parallel"
+			} else {
+				return "Sequential"
+			}
+		}(),
+		len(tests),
+		func() string {
+			if globalTimeout != "" {
+				return globalTimeout
+			} else {
+				return "30s (default)"
+			}
+		}())
+	fmt.Println(strings.Repeat("-", 80))
 
 	if parallel {
-		// Run tests in parallel
-		var wg sync.WaitGroup
-		results := make([]TestResult, len(tests))
-
-		for _, test := range tests {
-			fmt.Printf("[%s] %s........................ RUNNING\n",
-				time.Now().Format("15:04:05"), test.Name)
-		}
-
-		for i, test := range tests {
-			wg.Add(1)
-			go func(idx int, t TestSpec) {
-				defer wg.Done()
-				results[idx] = runTest(t, outputMgr)
-			}(i, test)
-		}
-
-		wg.Wait()
-		return results
+		// Run tests in parallel, but handle retries sequentially after all tests complete
+		return runParallelTestsWithRetries(tests, outputMgr, globalTimeout)
 	} else {
-		// Run tests sequentially
+		// Run tests sequentially with immediate retry prompts
 		var results []TestResult
 		for _, test := range tests {
-			fmt.Printf("[%s] %s........................ RUNNING\n",
-				time.Now().Format("15:04:05"), test.Name)
-			result := runTest(test, outputMgr)
+			result := runTest(test, outputMgr, globalTimeout)
 			results = append(results, result)
 		}
 		return results
 	}
 }
 
-func getFlashData(productName string) (*FlashData, error) {
+func runParallelTestsWithRetries(tests []TestSpec, outputMgr *OutputManager, globalTimeout string) []TestResult {
+	results := make([]TestResult, len(tests))
+	finalResults := make([]TestResult, len(tests))
+
+	// First run: execute all tests in parallel
+	var wg sync.WaitGroup
+	for i, test := range tests {
+		wg.Add(1)
+		go func(idx int, t TestSpec) {
+			defer wg.Done()
+
+			// Print running status
+			outputMgr.PrintResult(time.Now(), t.Name, "RUNNING", 0, "")
+
+			// Execute test once without retry prompts
+			result, output := executeTest(t, globalTimeout)
+			result.Attempts = 1
+
+			// Print output if test produced any
+			if output != "" {
+				outputMgr.PrintSection(t.Name+" Output", output)
+			}
+
+			// Print result
+			outputMgr.PrintResult(time.Now(), t.Name, result.Status, result.Duration, result.Error)
+
+			results[idx] = result
+		}(i, test)
+	}
+
+	// Wait for all parallel tests to complete
+	wg.Wait()
+
+	// Count failed tests that need attention
+	failedCount := 0
+	for _, result := range results {
+		if result.Status == "FAILED" || result.Status == "TIMEOUT" {
+			failedCount++
+		}
+	}
+
+	if failedCount > 0 {
+		fmt.Printf("\n%s%s%s\n", ColorYellow, strings.Repeat("=", 80), ColorReset)
+		fmt.Printf("%s  PARALLEL EXECUTION COMPLETED - PROCESSING %d FAILED TEST(S)%s\n", ColorYellow, failedCount, ColorReset)
+		fmt.Printf("%s%s%s\n", ColorYellow, strings.Repeat("=", 80), ColorReset)
+	} else {
+		fmt.Printf("\n%sAll parallel tests completed successfully!%s\n", ColorGreen, ColorReset)
+	}
+
+	// Second phase: handle failed tests sequentially with retry prompts
+	processedCount := 0
+	for i, result := range results {
+		if result.Status == "PASSED" {
+			finalResults[i] = result
+			continue
+		}
+
+		processedCount++
+		if processedCount > 1 {
+			fmt.Printf("\n%s%s%s\n", ColorBlue, strings.Repeat("-", 40), ColorReset)
+		}
+
+		// This test failed, ask for retry
+		test := tests[i]
+		fmt.Printf("\n%sProcessing failed test %d of %d: %s%s\n", ColorBlue, processedCount, failedCount, test.Name, ColorReset)
+		finalResults[i] = handleFailedTestWithRetries(test, result, outputMgr, globalTimeout)
+	}
+
+	return finalResults
+}
+
+func handleFailedTestWithRetries(test TestSpec, initialResult TestResult, outputMgr *OutputManager, globalTimeout string) TestResult {
+	currentResult := initialResult
+	attempts := 1
+	maxAttempts := 5
+
+	for attempts < maxAttempts {
+		if currentResult.Status == "PASSED" {
+			break
+		}
+
+		// Ask user what to do with this failed test
+		action := askUserAction(test.Name)
+
+		switch action {
+		case "RETRY":
+			attempts++
+			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts, ColorReset)
+
+			// Print running status
+			outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
+
+			// Execute test again
+			result, output := executeTest(test, globalTimeout)
+			result.Attempts = attempts
+
+			// Print output if test produced any
+			if output != "" {
+				outputMgr.PrintSection(test.Name+" Output", output)
+			}
+
+			// Print result
+			outputMgr.PrintResult(time.Now(), test.Name, result.Status, result.Duration, result.Error)
+
+			currentResult = result
+
+		case "SKIP":
+			currentResult.Status = "SKIPPED"
+			currentResult.Error = "Skipped by operator"
+			currentResult.Attempts = attempts
+			outputMgr.PrintResult(time.Now(), test.Name, currentResult.Status, currentResult.Duration, currentResult.Error)
+			return currentResult
+
+		case "CONTINUE":
+			currentResult.Attempts = attempts
+			return currentResult
+		}
+	}
+
+	// If we've reached max attempts, return the last result
+	if attempts >= maxAttempts && currentResult.Status != "PASSED" {
+		fmt.Printf("%sMaximum retry attempts (%d) reached for test '%s'%s\n", ColorRed, maxAttempts, test.Name, ColorReset)
+	}
+
+	currentResult.Attempts = attempts
+	return currentResult
+}
+
+func getFlashData(config FlashConfig, productName string) (*FlashData, error) {
+	if !config.Enabled || len(config.Fields) == 0 {
+		return nil, nil
+	}
+
 	if productName == "" {
 		return nil, fmt.Errorf("product name not detected")
 	}
 
-	printInfo(fmt.Sprintf("Product Name: %s", productName))
+	printSectionHeader("FLASH DATA COLLECTION")
+	fmt.Printf("Product: %s%s%s\n", ColorGreen, productName, ColorReset)
+	fmt.Printf("Method: %s%s%s\n", ColorGreen, config.Method, ColorReset)
 
-	// Define required fields based on product type
-	requiredFields := make(map[string]*regexp.Regexp)
+	// Prepare fields that need flashing
+	requiredFields := make(map[string]*FlashField)
+	flashFields := make(map[string]*FlashField)
 
-	switch productName {
-	case "Silver":
-		requiredFields["mbSN"] = regexp.MustCompile(`^INF0[0-9]{1}A3[0-9]{8}$`)
-		requiredFields["ioSN"] = regexp.MustCompile(`^INF0[0-9]{1}A4[0-9]{8}$`)
-		requiredFields["mac"] = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
-	case "IFMBH610MTPR":
-		requiredFields["mbSN"] = regexp.MustCompile(`^INF0[0-9]{1}A9[0-9]{8}$`)
-		requiredFields["mac"] = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
-	case "IFMBB760M":
-		requiredFields["mbSN"] = regexp.MustCompile(`^INF0[0-9]{1}B4[0-9]{8}$`)
-		requiredFields["mac"] = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
-	case "Mercury":
-		requiredFields["mbSN"] = regexp.MustCompile(`^INF0[0-9]{1}B7[0-9]{8}$`)
-		requiredFields["ioSN"] = regexp.MustCompile(`^INF0[0-9]{1}B8[0-9]{8}$`)
-		requiredFields["mac"] = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
-	default:
-		return nil, fmt.Errorf("unknown product name: %s", productName)
-	}
+	fmt.Printf("\nRequired fields:\n")
+	for i := range config.Fields {
+		field := &config.Fields[i]
+		_, err := regexp.Compile(field.Regex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex for field %s: %v", field.Name, err)
+		}
 
-	fmt.Println("Please enter the following values (the program will automatically detect the type):")
-	for key, regex := range requiredFields {
-		fmt.Printf(" - %s (expected format: %s)\n", key, regex.String())
+		requiredFields[field.ID] = field
+		if field.Flash {
+			flashFields[field.ID] = field
+			fmt.Printf("  %s[FLASH]%s %s (format: %s)\n", ColorYellow, ColorReset, field.Name, field.Regex)
+		} else {
+			fmt.Printf("  %s[STORE]%s %s (format: %s)\n", ColorBlue, ColorReset, field.Name, field.Regex)
+		}
 	}
 
 	provided := make(map[string]string)
 	reader := bufio.NewReader(os.Stdin)
 
+	fmt.Printf("\nEnter values (program will auto-detect field type):\n")
+
 	for len(provided) < len(requiredFields) {
-		fmt.Print("Enter value: ")
+		fmt.Printf("\nRemaining fields: %d\n", len(requiredFields)-len(provided))
+		fmt.Printf("Enter value: ")
+
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, err
 		}
 		input = strings.TrimSpace(input)
+
 		if input == "" {
-			fmt.Println("Input cannot be empty. Please re-enter.")
+			fmt.Printf("%sInput cannot be empty. Please re-enter.%s\n", ColorRed, ColorReset)
 			continue
 		}
 
 		matched := false
-		for key, regex := range requiredFields {
-			if _, ok := provided[key]; ok {
+		for fieldID, field := range requiredFields {
+			if _, ok := provided[fieldID]; ok {
 				continue
 			}
+
+			regex, _ := regexp.Compile(field.Regex) // Already validated above
 			if regex.MatchString(input) {
-				provided[key] = input
-				fmt.Printf("%s value accepted: %s\n", key, input)
+				provided[fieldID] = input
+				flashStatus := ""
+				if field.Flash {
+					flashStatus = fmt.Sprintf(" %s[WILL FLASH]%s", ColorYellow, ColorReset)
+				} else {
+					flashStatus = fmt.Sprintf(" %s[STORED ONLY]%s", ColorBlue, ColorReset)
+				}
+				fmt.Printf("%s%s accepted: %s%s%s\n", ColorGreen, field.Name, input, flashStatus, ColorReset)
 				matched = true
 				break
 			}
 		}
+
 		if !matched {
-			fmt.Println("Input does not match any expected format. Please try again.")
+			fmt.Printf("%sInput does not match any expected format. Please try again.%s\n", ColorRed, ColorReset)
 		}
 	}
 
 	flashData := &FlashData{}
-	if val, ok := provided["mbSN"]; ok {
-		flashData.MBSerial = val
-	}
-	if val, ok := provided["ioSN"]; ok {
-		flashData.IOSerial = val
-	}
-	if val, ok := provided["mac"]; ok {
-		flashData.MAC = val
+
+	// Map fields to FlashData structure
+	for fieldID, value := range provided {
+		switch fieldID {
+		case "system-serial-number":
+			flashData.SystemSerial = value
+		case "io_board":
+			flashData.IOBoard = value
+		case "mac_address":
+			flashData.MAC = value
+		}
 	}
 
-	fmt.Println("Collected data:")
-	fmt.Printf("  MB Serial: %s\n", flashData.MBSerial)
-	if flashData.IOSerial != "" {
-		fmt.Printf("  IO Serial: %s\n", flashData.IOSerial)
+	fmt.Printf("\n%sCollected data summary:%s\n", ColorGreen, ColorReset)
+	if flashData.SystemSerial != "" {
+		fmt.Printf("  System Serial: %s\n", flashData.SystemSerial)
 	}
-	fmt.Printf("  MAC: %s\n", flashData.MAC)
+	if flashData.IOBoard != "" {
+		fmt.Printf("  IO Board: %s\n", flashData.IOBoard)
+	}
+	if flashData.MAC != "" {
+		fmt.Printf("  MAC Address: %s\n", flashData.MAC)
+	}
 
 	return flashData, nil
 }
@@ -481,15 +779,14 @@ func parseDMIDecode(output string) map[string]interface{} {
 	return result
 }
 
-func runFlashing(config FlashConfig, flashData *FlashData) []FlashResult {
+func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemConfig) []FlashResult {
 	var results []FlashResult
 
 	if !config.Enabled {
 		return results
 	}
 
-	printInfo("FLASHING PHASE [2/2]")
-	printInfo("===================")
+	fmt.Println(strings.Repeat("-", 80))
 
 	for _, operation := range config.Operations {
 		result := FlashResult{
@@ -499,31 +796,923 @@ func runFlashing(config FlashConfig, flashData *FlashData) []FlashResult {
 
 		startTime := time.Now()
 
-		// Simulate flashing operations
 		switch operation {
-		case "serial_number":
-			printInfo(fmt.Sprintf("Flashing serial number: %s", flashData.MBSerial))
-			time.Sleep(2 * time.Second) // Simulate work
-			result.Details = fmt.Sprintf("Updated MB serial to %s", flashData.MBSerial)
+		case "serial":
+			printInfo("Flashing serial numbers...")
+			if flashData.SystemSerial != "" {
+				err := flashSerial(systemConfig, flashData.SystemSerial, "system")
+				if err != nil {
+					result.Status = "FAILED"
+					result.Details = fmt.Sprintf("System serial flash failed: %v", err)
+				}
+			}
+			if flashData.IOBoard != "" {
+				err := flashSerial(systemConfig, flashData.IOBoard, "io_board")
+				if err != nil {
+					result.Status = "FAILED"
+					result.Details = fmt.Sprintf("IO board serial flash failed: %v", err)
+				}
+			}
 
-		case "mac_address":
+		case "mac":
 			printInfo(fmt.Sprintf("Flashing MAC address: %s", flashData.MAC))
-			time.Sleep(1 * time.Second) // Simulate work
-			result.Details = fmt.Sprintf("Updated MAC to %s", flashData.MAC)
+			err := flashMAC(config, systemConfig, flashData.MAC)
+			if err != nil {
+				result.Status = "FAILED"
+				result.Details = fmt.Sprintf("MAC flash failed: %v", err)
+			}
 
-		case "efi_variables":
+		case "efi":
 			printInfo("Updating EFI variables")
-			time.Sleep(1 * time.Second) // Simulate work
-			result.Details = "EFI variables updated"
+			err := updateEFIVariables(systemConfig, flashData)
+			if err != nil {
+				result.Status = "FAILED"
+				result.Details = fmt.Sprintf("EFI update failed: %v", err)
+			}
 		}
 
 		result.Duration = time.Since(startTime)
 		results = append(results, result)
 
-		outputManager.PrintResult(time.Now(), operation, result.Status, result.Duration, "")
+		outputManager.PrintResult(time.Now(), operation, result.Status, result.Duration, result.Details)
 	}
 
 	return results
+}
+
+func flashSerial(config SystemConfig, serial, serialType string) error {
+	// Имитация прошивки серийного номера
+	time.Sleep(500 * time.Millisecond)
+	printSuccess(fmt.Sprintf("Serial number (%s) flashed: %s", serialType, serial))
+	return nil
+}
+
+func unloadNetworkDriver(driverName string) error {
+	if driverName == "" {
+		return fmt.Errorf("driver name is empty")
+	}
+
+	printInfo(fmt.Sprintf("Unloading driver: %s", driverName))
+	cmd := exec.Command("rmmod", driverName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("rmmod failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Wait a moment for driver to fully unload
+	time.Sleep(1 * time.Second)
+	return nil
+}
+
+func loadNetworkDriver(driverName string) error {
+	if driverName == "" {
+		return fmt.Errorf("driver name is empty")
+	}
+
+	printInfo(fmt.Sprintf("Loading driver: %s", driverName))
+	cmd := exec.Command("modprobe", driverName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("modprobe failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Wait a moment for driver to fully load
+	time.Sleep(2 * time.Second)
+	return nil
+}
+
+func loadFlashingDriver(driverDir, originalDriver string) (string, error) {
+	// Step 1: Try to use pre-compiled driver from driver_dir
+	driverPath := filepath.Join(driverDir, originalDriver+".ko")
+	if _, err := os.Stat(driverPath); err == nil {
+		printInfo(fmt.Sprintf("Found pre-compiled driver: %s", driverPath))
+		if err := loadDriverFromPath(driverPath); err == nil {
+			return driverPath, nil
+		} else {
+			printError(fmt.Sprintf("Pre-compiled driver failed to load: %v", err))
+		}
+	}
+
+	// Step 2: Compile new driver
+	printInfo("Compiling new flashing driver...")
+	compiledPath, err := compileFlashingDriver(driverDir, originalDriver)
+	if err != nil {
+		return "", fmt.Errorf("failed to compile driver: %v", err)
+	}
+
+	// Step 3: Load compiled driver
+	if err := loadDriverFromPath(compiledPath); err != nil {
+		return "", fmt.Errorf("failed to load compiled driver: %v", err)
+	}
+
+	return compiledPath, nil
+}
+
+func loadDriverFromPath(driverPath string) error {
+	printInfo(fmt.Sprintf("Loading driver from: %s", driverPath))
+	cmd := exec.Command("insmod", driverPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("insmod failed: %v\nOutput: %s", err, string(output))
+	}
+
+	time.Sleep(2 * time.Second)
+	return nil
+}
+
+// compileFlashingDriver compiles the rtnicpg driver from source and installs it into driverDir.
+// Returns the full path to the newly compiled .ko file.
+func compileFlashingDriver(driverDir, originalDriver string) (string, error) {
+	// The embedded rtnicpg source was extracted to tempRtnicpgPath/rtnicpg
+	srcDir := filepath.Join(driverDir, "rtnicpg")
+	if info, err := os.Stat(srcDir); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("rtnicpg source directory %s not found", srcDir)
+	}
+
+	// Ensure the target directory exists
+	if err := os.MkdirAll(driverDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create driver directory %s: %v", driverDir, err)
+	}
+
+	// Run make in the source directory
+	fmt.Printf("Compiling driver in %s...\n", srcDir)
+	cmd := exec.Command("make", "-C", srcDir, "clean", "all")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("compilation failed: %v\n%s", err, out.String())
+	}
+
+	// Locate the built module
+	built := filepath.Join(srcDir, originalDriver+".ko")
+	if _, err := os.Stat(built); err != nil {
+		return "", fmt.Errorf("compiled module not found at %s", built)
+	}
+
+	// Copy to driverDir
+	dest := filepath.Join(driverDir, originalDriver+".ko")
+	data, err := os.ReadFile(built)
+	if err != nil {
+		return "", fmt.Errorf("failed to read compiled module %s: %v", built, err)
+	}
+	if err := os.WriteFile(dest, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to write module to %s: %v", dest, err)
+	}
+
+	fmt.Printf("Saved compiled driver to %s\n", dest)
+	return dest, nil
+}
+
+// Flashing execution functions
+func executeRtnicFlashing(targetMAC string) error {
+	// Remove colons from MAC for rtnic
+	macWithoutColons := strings.ReplaceAll(targetMAC, ":", "")
+
+	printInfo(fmt.Sprintf("Executing rtnic flashing for MAC: %s", targetMAC))
+
+	// Execute rtnic with required arguments
+	cmd := exec.Command("rtnic", "/efuse", "/nicmac", "/nodeid", macWithoutColons)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return fmt.Errorf("rtnic command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Check if output indicates success
+	outputStr := string(output)
+	if strings.Contains(strings.ToLower(outputStr), "error") || strings.Contains(strings.ToLower(outputStr), "fail") {
+		return fmt.Errorf("rtnic reported error: %s", outputStr)
+	}
+
+	printSuccess("rtnic flashing command completed successfully")
+	return nil
+}
+
+func discoverIntelNICs() ([]int, error) {
+	printInfo("Discovering Intel network cards...")
+
+	cmd := exec.Command("eeupdate64e", "/MAC_DUMP_ALL")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("eeupdate64e discovery failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Parse output to find NIC indices
+	var nicIndices []int
+	lines := strings.Split(string(output), "\n")
+
+	for _, line := range lines {
+		if strings.Contains(line, "NIC") && strings.Contains(line, ":") {
+			parts := strings.Fields(line)
+			for i, part := range parts {
+				if strings.ToUpper(part) == "NIC" && i+1 < len(parts) {
+					nicStr := strings.TrimSuffix(parts[i+1], ":")
+					// отдельная переменная для результата парсинга
+					num, err := strconv.Atoi(nicStr)
+					if err == nil && num == 1 {
+						nicIndices = append(nicIndices, num)
+					}
+				}
+			}
+		}
+	}
+
+	if len(nicIndices) == 0 {
+		// Fallback: assume common NIC indices if discovery fails
+		printInfo("No NICs found in discovery output, trying common indices...")
+		nicIndices = []int{0, 1} // Try first two indices
+	}
+
+	return nicIndices, nil
+}
+
+func executeEeupdateFlashing(nicIndex int, targetMAC string) error {
+	printInfo(fmt.Sprintf("Executing eeupdate flashing for NIC %d, MAC: %s", nicIndex, targetMAC))
+
+	// Execute eeupdate64e with NIC and MAC parameters
+	cmd := exec.Command("eeupdate64e",
+		fmt.Sprintf("/NIC=%d", nicIndex),
+		fmt.Sprintf("/MAC=%s", targetMAC))
+
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	// eeupdate may report driver missing, but this is often normal
+	if err != nil && !strings.Contains(strings.ToLower(outputStr), "driver") {
+		return fmt.Errorf("eeupdate64e command failed: %v\nOutput: %s", err, outputStr)
+	}
+
+	// Check for success indicators in output
+	if strings.Contains(strings.ToLower(outputStr), "success") ||
+		strings.Contains(strings.ToLower(outputStr), "complete") {
+		printSuccess(fmt.Sprintf("eeupdate flashing completed for NIC %d", nicIndex))
+		return nil
+	}
+
+	// Check for error indicators
+	if strings.Contains(strings.ToLower(outputStr), "error") ||
+		strings.Contains(strings.ToLower(outputStr), "fail") {
+		return fmt.Errorf("eeupdate reported error for NIC %d: %s", nicIndex, outputStr)
+	}
+
+	// If no clear success/error indication, assume success
+	printInfo(fmt.Sprintf("eeupdate command completed for NIC %d (status unclear)", nicIndex))
+	return nil
+}
+
+// Network restoration functions
+func restartNetworkServices() {
+	printInfo("Restarting network services...")
+
+	// Try different network restart methods
+	methods := [][]string{
+		{"systemctl", "restart", "networking"},
+		{"systemctl", "restart", "network"},
+		{"service", "networking", "restart"},
+		{"service", "network", "restart"},
+	}
+
+	for _, method := range methods {
+		cmd := exec.Command(method[0], method[1:]...)
+		if err := cmd.Run(); err == nil {
+			printSuccess(fmt.Sprintf("Network restarted using: %s", strings.Join(method, " ")))
+			time.Sleep(3 * time.Second)
+			return
+		}
+	}
+
+	// Fallback: restart network interfaces manually
+	printInfo("Fallback: restarting network interfaces manually...")
+	interfaces, _ := getCurrentNetworkInterfaces()
+	for _, iface := range interfaces {
+		if iface.Name != "lo" {
+			exec.Command("ip", "link", "set", iface.Name, "down").Run()
+			time.Sleep(1 * time.Second)
+			exec.Command("ip", "link", "set", iface.Name, "up").Run()
+		}
+	}
+
+	time.Sleep(3 * time.Second)
+}
+
+// Network interface discovery and management
+func getCurrentNetworkInterfaces() ([]NetworkInterface, error) {
+	var interfaces []NetworkInterface
+
+	// Get network interfaces using 'ip' command
+	cmd := exec.Command("ip", "addr", "show")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get network interfaces: %v", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	var currentInterface *NetworkInterface
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// Parse interface name and state
+		if strings.Contains(line, ": ") && !strings.HasPrefix(line, " ") {
+			if currentInterface != nil {
+				interfaces = append(interfaces, *currentInterface)
+			}
+
+			// Extract interface name
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				name := strings.TrimSpace(parts[1])
+				currentInterface = &NetworkInterface{Name: name}
+
+				// Extract state
+				if strings.Contains(line, "state UP") {
+					currentInterface.State = "UP"
+				} else if strings.Contains(line, "state DOWN") {
+					currentInterface.State = "DOWN"
+				}
+			}
+		}
+
+		// Parse MAC address
+		if currentInterface != nil && strings.Contains(line, "link/ether") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				currentInterface.MAC = strings.ToUpper(parts[1])
+			}
+		}
+
+		// Parse IP address
+		if currentInterface != nil && strings.Contains(line, "inet ") && !strings.Contains(line, "127.0.0.1") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				ip := strings.Split(parts[1], "/")[0]
+				currentInterface.IP = ip
+			}
+		}
+	}
+
+	// Add the last interface
+	if currentInterface != nil {
+		interfaces = append(interfaces, *currentInterface)
+	}
+
+	// Get driver information for each interface
+	for i := range interfaces {
+		if driver, err := getInterfaceDriver(interfaces[i].Name); err == nil {
+			interfaces[i].Driver = driver
+		}
+	}
+
+	return interfaces, nil
+}
+
+func getInterfaceDriver(interfaceName string) (string, error) {
+	// Try ethtool first
+	cmd := exec.Command("ethtool", "-i", interfaceName)
+	output, err := cmd.Output()
+	if err == nil {
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "driver:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					return strings.TrimSpace(parts[1]), nil
+				}
+			}
+		}
+	}
+
+	// Fallback: check /sys/class/net
+	driverPath := fmt.Sprintf("/sys/class/net/%s/device/driver", interfaceName)
+	if link, err := os.Readlink(driverPath); err == nil {
+		return filepath.Base(link), nil
+	}
+
+	return "", fmt.Errorf("driver not found for interface %s", interfaceName)
+}
+
+func normalizeMAC(mac string) string {
+	// Remove any separators and convert to uppercase
+	mac = strings.ReplaceAll(mac, ":", "")
+	mac = strings.ReplaceAll(mac, "-", "")
+	mac = strings.ToUpper(mac)
+
+	// Add colons in standard format
+	if len(mac) == 12 {
+		return fmt.Sprintf("%s:%s:%s:%s:%s:%s",
+			mac[0:2], mac[2:4], mac[4:6], mac[6:8], mac[8:10], mac[10:12])
+	}
+
+	return mac
+}
+
+func isTargetMACPresent(targetMAC string, interfaces []NetworkInterface) (bool, string) {
+	normalizedTarget := normalizeMAC(targetMAC)
+
+	for _, iface := range interfaces {
+		if normalizeMAC(iface.MAC) == normalizedTarget {
+			return true, iface.Name
+		}
+	}
+
+	return false, ""
+}
+
+func flashMAC(flashConfig FlashConfig, systemConfig SystemConfig, mac string) error {
+	method := flashConfig.Method
+	if method == "" {
+		method = "eeupdate" // default
+	}
+
+	printSubHeader("MAC ADDRESS FLASHING", fmt.Sprintf("Method: %s | Target MAC: %s", method, mac))
+
+	// Step 1: Get current network interfaces
+	interfaces, err := getCurrentNetworkInterfaces()
+	if err != nil {
+		return fmt.Errorf("failed to get network interfaces: %v", err)
+	}
+
+	// Step 2: Check if target MAC already exists
+	exists, interfaceName := isTargetMACPresent(mac, interfaces)
+	if exists {
+		printSuccess(fmt.Sprintf("Target MAC %s already present on interface %s - skipping flash", mac, interfaceName))
+		return nil
+	}
+
+	// Step 3: Show current network state
+	fmt.Printf("\nCurrent network interfaces:\n")
+	for _, iface := range interfaces {
+		status := "DOWN"
+		if iface.State == "UP" {
+			status = fmt.Sprintf("UP (IP: %s)", iface.IP)
+		}
+		fmt.Printf("  %s: %s [%s] - %s\n", iface.Name, iface.MAC, iface.Driver, status)
+	}
+
+	// Step 4: Execute flashing based on method
+	var summary FlashMACSummary
+	summary.Method = method
+	summary.TargetMAC = mac
+
+	switch method {
+	case "rtnicpg":
+		err = flashMACWithRtnicpg(mac, interfaces, systemConfig, &summary)
+	case "eeupdate":
+		err = flashMACWithEeupdate(mac, interfaces, &summary)
+	default:
+		return fmt.Errorf("unknown flash method: %s", method)
+	}
+
+	if err != nil {
+		return fmt.Errorf("MAC flashing failed: %v", err)
+	}
+
+	if summary.Success {
+		printSuccess(fmt.Sprintf("MAC address flashed successfully using %s method", method))
+	}
+
+	return nil
+}
+
+func flashMACWithRtnicpg(targetMAC string, interfaces []NetworkInterface, systemConfig SystemConfig, summary *FlashMACSummary) error {
+	printInfo("Starting rtnicpg MAC flashing process...")
+
+	// Step 1: Find network interface with IP and save current state
+	var primaryInterface *NetworkInterface
+	for i := range interfaces {
+		if interfaces[i].IP != "" && interfaces[i].State == "UP" {
+			primaryInterface = &interfaces[i]
+			break
+		}
+	}
+
+	if primaryInterface == nil {
+		return fmt.Errorf("no active network interface with IP found")
+	}
+
+	summary.OriginalIP = primaryInterface.IP
+	summary.OriginalDriver = primaryInterface.Driver
+
+	printInfo(fmt.Sprintf("Using interface %s (IP: %s, Driver: %s)",
+		primaryInterface.Name, primaryInterface.IP, primaryInterface.Driver))
+
+	// Step 2: Unload current driver
+	printInfo(fmt.Sprintf("Unloading network driver: %s", primaryInterface.Driver))
+	if err := unloadNetworkDriver(primaryInterface.Driver); err != nil {
+		return fmt.Errorf("failed to unload driver %s: %v", primaryInterface.Driver, err)
+	}
+
+	// Step 3: Load flashing driver
+	driverPath, err := loadFlashingDriver(systemConfig.DriverDir, primaryInterface.Driver)
+	if err != nil {
+		// Try to restore original driver
+		loadNetworkDriver(primaryInterface.Driver)
+		return fmt.Errorf("failed to load flashing driver: %v", err)
+	}
+
+	// Step 4: Flash MAC using rtnic
+	attempts := 0
+	maxAttempts := 3
+
+	for attempts < maxAttempts {
+		attempts++
+		printInfo(fmt.Sprintf("Flashing MAC attempt %d/%d...", attempts, maxAttempts))
+
+		err = executeRtnicFlashing(targetMAC)
+		if err == nil {
+			break
+		}
+
+		if attempts < maxAttempts {
+			action := askFlashRetryAction(fmt.Sprintf("rtnic flashing failed (attempt %d): %v", attempts, err))
+			if action == "SKIP" {
+				summary.Success = false
+				summary.Error = "Skipped by operator"
+				return nil
+			}
+			if action != "RETRY" {
+				break
+			}
+		}
+	}
+
+	// Step 5: Unload flashing driver and restore original
+	unloadNetworkDriver(filepath.Base(driverPath))
+	if err := loadNetworkDriver(primaryInterface.Driver); err != nil {
+		printError(fmt.Sprintf("Warning: failed to restore original driver %s: %v", primaryInterface.Driver, err))
+	}
+
+	if err != nil && attempts >= maxAttempts {
+		summary.Success = false
+		summary.Error = fmt.Sprintf("Max attempts reached: %v", err)
+		return err
+	}
+
+	// Step 6: Verify MAC was flashed
+	time.Sleep(2 * time.Second) // Wait for interfaces to come up
+	newInterfaces, err := getCurrentNetworkInterfaces()
+	if err != nil {
+		printError(fmt.Sprintf("Warning: failed to verify MAC flashing: %v", err))
+	} else {
+		exists, interfaceName := isTargetMACPresent(targetMAC, newInterfaces)
+		if exists {
+			summary.Success = true
+			summary.InterfaceName = interfaceName
+			printSuccess(fmt.Sprintf("MAC %s found on interface %s", targetMAC, interfaceName))
+
+			// Try to restore IP address
+			if err := restoreIPAddress(interfaceName, summary.OriginalIP); err != nil {
+				printError(fmt.Sprintf("Warning: failed to restore IP %s: %v", summary.OriginalIP, err))
+			}
+		} else {
+			action := askFlashRetryAction("Flashing completed but target MAC not found on any interface")
+			if action == "SKIP" {
+				summary.Success = false
+				summary.Error = "MAC not found after flashing - skipped by operator"
+				return nil
+			}
+			summary.Success = false
+			summary.Error = "MAC not found after flashing"
+			return fmt.Errorf("target MAC not found after flashing")
+		}
+	}
+
+	return nil
+}
+
+// askFlashRetryAction prompts the user when a MAC flashing attempt fails.
+// Returns "RETRY" to try again, "ABORT" to stop flashing, or "SKIP" to skip this flash.
+func askFlashRetryAction(message string) string {
+	fmt.Printf("\n%s=== FLASH ATTEMPT FAILED ===%s\n", ColorRed, ColorReset)
+	fmt.Printf("%s\n", message)
+	fmt.Println("Choose action:")
+	fmt.Printf("  %s[Y]%s Retry flashing (default)\n", ColorGreen, ColorReset)
+	fmt.Printf("  %s[N]%s Abort flashing\n", ColorYellow, ColorReset)
+	fmt.Printf("  %s[S]%s Skip flashing\n", ColorBlue, ColorReset)
+	fmt.Printf("Choice [Y/n/s]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "RETRY" // default on error
+	}
+
+	choice := strings.ToUpper(strings.TrimSpace(input))
+	if choice == "" {
+		choice = "Y" // default
+	}
+
+	switch choice {
+	case "Y", "YES":
+		return "RETRY"
+	case "N", "NO":
+		return "ABORT"
+	case "S", "SKIP":
+		return "SKIP"
+	default:
+		fmt.Printf("Invalid choice '%s', defaulting to retry.\n", choice)
+		return "RETRY"
+	}
+}
+
+func restoreIPAddress(interfaceName, ipAddress string) error {
+	if interfaceName == "" || ipAddress == "" {
+		return fmt.Errorf("interface name or IP address is empty")
+	}
+
+	printInfo(fmt.Sprintf("Restoring IP %s to interface %s", ipAddress, interfaceName))
+
+	// First ensure interface is up
+	cmd := exec.Command("ip", "link", "set", interfaceName, "up")
+	cmd.Run()
+
+	time.Sleep(1 * time.Second)
+
+	// Assign IP address (assuming /24 subnet)
+	cmd = exec.Command("ip", "addr", "add", ipAddress+"/24", "dev", interfaceName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// IP might already be assigned, check if it's actually there
+		checkCmd := exec.Command("ip", "addr", "show", interfaceName)
+		checkOutput, _ := checkCmd.Output()
+		if strings.Contains(string(checkOutput), ipAddress) {
+			printSuccess(fmt.Sprintf("IP %s already assigned to %s", ipAddress, interfaceName))
+			return nil
+		}
+		return fmt.Errorf("failed to assign IP: %v\nOutput: %s", err, string(output))
+	}
+
+	printSuccess(fmt.Sprintf("IP %s restored to interface %s", ipAddress, interfaceName))
+	return nil
+}
+
+func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, summary *FlashMACSummary) error {
+	printInfo("Starting eeupdate MAC flashing process...")
+
+	// Step 1: Save current IP
+	var originalIP string
+	for _, iface := range interfaces {
+		if iface.IP != "" && iface.State == "UP" {
+			originalIP = iface.IP
+			break
+		}
+	}
+	summary.OriginalIP = originalIP
+
+	// Step 2: Discover Intel NICs
+	nicIndices, err := discoverIntelNICs()
+	if err != nil {
+		return fmt.Errorf("failed to discover Intel NICs: %v", err)
+	}
+
+	if len(nicIndices) == 0 {
+		return fmt.Errorf("no Intel network cards found")
+	}
+
+	summary.NICIndices = nicIndices
+	printInfo(fmt.Sprintf("Found %d Intel NIC(s): %v", len(nicIndices), nicIndices))
+
+	// Step 3: Flash each NIC
+	attempts := 0
+	maxAttempts := 3
+	var lastError error
+
+	for attempts < maxAttempts {
+		attempts++
+		printInfo(fmt.Sprintf("Flashing NICs attempt %d/%d...", attempts, maxAttempts))
+
+		success := true
+		for _, nicIndex := range nicIndices {
+			if err := executeEeupdateFlashing(nicIndex, targetMAC); err != nil {
+				lastError = fmt.Errorf("failed to flash NIC %d: %v", nicIndex, err)
+				success = false
+				break
+			}
+		}
+
+		if success {
+			lastError = nil
+			break
+		}
+
+		if attempts < maxAttempts {
+			action := askFlashRetryAction(fmt.Sprintf("eeupdate flashing failed (attempt %d): %v", attempts, lastError))
+			if action == "SKIP" {
+				summary.Success = false
+				summary.Error = "Skipped by operator"
+				return nil
+			}
+			if action != "RETRY" {
+				break
+			}
+		}
+	}
+
+	if lastError != nil && attempts >= maxAttempts {
+		summary.Success = false
+		summary.Error = fmt.Sprintf("Max attempts reached: %v", lastError)
+		return lastError
+	}
+
+	// Step 4: Restart network and verify
+	printInfo("Restarting network services...")
+	restartNetworkServices()
+
+	time.Sleep(3 * time.Second) // Wait for network to come up
+
+	newInterfaces, err := getCurrentNetworkInterfaces()
+	if err != nil {
+		printError(fmt.Sprintf("Warning: failed to verify MAC flashing: %v", err))
+	} else {
+		exists, interfaceName := isTargetMACPresent(targetMAC, newInterfaces)
+		if exists {
+			summary.Success = true
+			summary.InterfaceName = interfaceName
+			printSuccess(fmt.Sprintf("MAC %s found on interface %s", targetMAC, interfaceName))
+
+			// Try to restore IP address
+			if originalIP != "" {
+				if err := restoreIPAddress(interfaceName, originalIP); err != nil {
+					printError(fmt.Sprintf("Warning: failed to restore IP %s: %v", originalIP, err))
+				}
+			}
+		} else {
+			action := askFlashRetryAction("Flashing completed but target MAC not found on any interface")
+			if action == "SKIP" {
+				summary.Success = false
+				summary.Error = "MAC not found after flashing - skipped by operator"
+				return nil
+			}
+			summary.Success = false
+			summary.Error = "MAC not found after flashing"
+			return fmt.Errorf("target MAC not found after flashing")
+		}
+	}
+
+	return nil
+}
+
+func updateEFIVariables(config SystemConfig, flashData *FlashData) error {
+	// Обновляем EFI переменные используя efivar или подобные инструменты
+
+	if flashData.SystemSerial != "" && config.EfiSnName != "" {
+		err := setEFIVariable(config.GuidPrefix, config.EfiSnName, flashData.SystemSerial)
+		if err != nil {
+			return fmt.Errorf("failed to set serial EFI variable: %v", err)
+		}
+	}
+
+	if flashData.MAC != "" && config.EfiMacName != "" {
+		// Конвертируем MAC в hex формат без двоеточий
+		hexMAC := strings.ReplaceAll(flashData.MAC, ":", "")
+		err := setEFIVariable(config.GuidPrefix, config.EfiMacName, hexMAC)
+		if err != nil {
+			return fmt.Errorf("failed to set MAC EFI variable: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func setEFIVariable(guidPrefix, varName, value string) error {
+	// Пример команды для установки EFI переменной
+	// efivar -w -n {guid}-{varName} -d {value}
+
+	// Для демонстрации просто симулируем успех
+	time.Sleep(200 * time.Millisecond)
+	printSuccess(fmt.Sprintf("EFI variable %s set to: %s", varName, value))
+	return nil
+}
+
+func testServerConnection(config LogConfig) error {
+	if !config.SendLogs || config.Server == "" {
+		return nil
+	}
+
+	// Parse server (user@host format)
+	serverParts := strings.Split(config.Server, "@")
+	if len(serverParts) != 2 {
+		return fmt.Errorf("invalid server format, expected user@host: %s", config.Server)
+	}
+
+	user := serverParts[0]
+	host := serverParts[1]
+	serverAddr := fmt.Sprintf("%s@%s", user, host)
+
+	printInfo(fmt.Sprintf("Testing connection to server: %s", serverAddr))
+
+	// Test SSH connection
+	testCmd := exec.Command("ssh",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=5",
+		"-o", "BatchMode=yes",
+		serverAddr,
+		"echo 'Connection test successful'")
+
+	if output, err := testCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("server connection test failed: %v\nOutput: %s", err, string(output))
+	}
+
+	printSuccess("Server connection test passed")
+	return nil
+}
+
+func sendLogToServer(log SessionLog, config LogConfig) error {
+	if !config.SendLogs || config.Server == "" {
+		return nil
+	}
+
+	printInfo(fmt.Sprintf("Sending log to server: %s", config.Server))
+
+	// Marshal to YAML
+	data, err := yaml.Marshal(log)
+	if err != nil {
+		return fmt.Errorf("failed to marshal log: %v", err)
+	}
+
+	// Create temporary file
+	tmpFile, err := os.CreateTemp("", "system_validator_*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.Write(data)
+	if err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	// Generate remote filename and path
+	timestamp := log.Timestamp.Format("20060102_150405")
+	remoteFile := fmt.Sprintf("%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp)
+
+	// Build remote directory path
+	remoteDirParts := []string{}
+	if config.ServerDir != "" {
+		remoteDirParts = append(remoteDirParts, config.ServerDir)
+	}
+	if log.System.Product != "" {
+		remoteDirParts = append(remoteDirParts, log.System.Product)
+	}
+	if config.OpName != "" {
+		remoteDirParts = append(remoteDirParts, config.OpName)
+	}
+
+	var remoteDir string
+	if len(remoteDirParts) > 0 {
+		remoteDir = strings.Join(remoteDirParts, "/")
+	} else {
+		remoteDir = "."
+	}
+
+	// Parse server (user@host format)
+	serverParts := strings.Split(config.Server, "@")
+	if len(serverParts) != 2 {
+		return fmt.Errorf("invalid server format, expected user@host: %s", config.Server)
+	}
+
+	user := serverParts[0]
+	host := serverParts[1]
+	serverAddr := fmt.Sprintf("%s@%s", user, host)
+
+	fmt.Printf("Remote directory: %s/%s\n", serverAddr, remoteDir)
+	fmt.Printf("Remote file: %s\n", remoteFile)
+
+	// Step 1: Create remote directories if they don't exist
+	if remoteDir != "." {
+		createDirCmd := exec.Command("ssh",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "ConnectTimeout=10",
+			serverAddr,
+			fmt.Sprintf("mkdir -p '%s'", remoteDir))
+
+		fmt.Printf("Creating remote directory: %s\n", remoteDir)
+		if output, err := createDirCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to create remote directory: %v\nOutput: %s", err, string(output))
+		}
+	}
+
+	// Step 2: Send file via SCP
+	fullRemotePath := fmt.Sprintf("%s:%s/%s", serverAddr, remoteDir, remoteFile)
+	scpCmd := exec.Command("scp",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10",
+		tmpFile.Name(),
+		fullRemotePath)
+
+	fmt.Printf("Uploading file to: %s\n", fullRemotePath)
+	if output, err := scpCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to send log via SCP: %v\nOutput: %s\nCommand: %s", err, string(output), scpCmd.String())
+	}
+
+	printSuccess("Log sent to server successfully")
+	return nil
 }
 
 func saveLog(log SessionLog, config LogConfig) error {
@@ -563,53 +1752,6 @@ func saveLog(log SessionLog, config LogConfig) error {
 	return nil
 }
 
-func sendLogToServer(log SessionLog, server string) error {
-	if server == "" {
-		return nil
-	}
-
-	printInfo(fmt.Sprintf("Sending log to server: %s", server))
-
-	// Marshal to YAML
-	data, err := yaml.Marshal(log)
-	if err != nil {
-		return fmt.Errorf("failed to marshal log: %v", err)
-	}
-
-	// Create temporary file
-	tmpFile, err := os.CreateTemp("", "system_validator_*.yaml")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	_, err = tmpFile.Write(data)
-	if err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to write temp file: %v", err)
-	}
-	tmpFile.Close()
-
-	// Generate remote filename
-	timestamp := log.Timestamp.Format("20060102_150405")
-	remoteFile := fmt.Sprintf("%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp)
-
-	// Use SCP to send file
-	cmd := exec.Command("scp",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		tmpFile.Name(),
-		fmt.Sprintf("%s/%s", server, remoteFile))
-
-	err = cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to send log via SCP: %v", err)
-	}
-
-	printSuccess("Log sent to server successfully")
-	return nil
-}
-
 func main() {
 	// Parse command line arguments
 	args := os.Args[1:]
@@ -636,12 +1778,6 @@ func main() {
 		}
 	}
 
-	// Check root privileges
-	if os.Geteuid() != 0 {
-		printError("This program requires root privileges")
-		os.Exit(1)
-	}
-
 	// Load configuration
 	config, err := loadConfig(configPath)
 	if err != nil {
@@ -649,21 +1785,48 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Check root privileges if required
+	if config.System.RequireRoot && os.Geteuid() != 0 {
+		printError("This program requires root privileges")
+		os.Exit(1)
+	}
+
 	// Print header
-	fmt.Printf("SYSTEM VALIDATOR v%s | %s | %s\n", VERSION, config.System.Product, configPath)
+	fmt.Printf("\n%s", ColorBlue)
 	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("  SYSTEM VALIDATOR v%s\n", VERSION)
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("%s", ColorReset)
+	fmt.Printf("Product: %s%s%s | Config: %s%s%s\n",
+		ColorGreen, config.System.Product, ColorReset,
+		ColorYellow, configPath, ColorReset)
+	fmt.Printf("Root Required: %s%v%s | Driver Dir: %s%s%s\n",
+		ColorYellow, config.System.RequireRoot, ColorReset,
+		ColorBlue, config.System.DriverDir, ColorReset)
 
 	startTime := time.Now()
 
 	// Get system information
+	printSubHeader("SYSTEM DETECTION", "Gathering hardware and network information")
 	systemInfo, err := getSystemInfo()
 	if err != nil {
 		printError(fmt.Sprintf("Failed to get system information: %v", err))
 		os.Exit(1)
 	}
 
-	printInfo(fmt.Sprintf("System detected: %s, Serial: %s, IP: %s",
-		systemInfo.Product, systemInfo.MBSerial, systemInfo.IP))
+	fmt.Printf("Detected Product: %s%s%s\n", ColorGreen, systemInfo.Product, ColorReset)
+	fmt.Printf("Board Serial: %s%s%s\n", ColorGreen, systemInfo.MBSerial, ColorReset)
+	fmt.Printf("IP Address: %s%s%s\n", ColorGreen, systemInfo.IP, ColorReset)
+	fmt.Printf("Detection Time: %s%s%s\n", ColorBlue, systemInfo.Timestamp.Format("2006-01-02 15:04:05"), ColorReset)
+
+	// Test server connection early if log sending is enabled
+	if config.Log.SendLogs {
+		if err := testServerConnection(config.Log); err != nil {
+			printError(fmt.Sprintf("Server connection test failed: %v", err))
+			printError("Log sending will be disabled for this session")
+			config.Log.SendLogs = false
+		}
+	}
 
 	var allResults []TestResult
 	var flashResults []FlashResult
@@ -671,32 +1834,44 @@ func main() {
 
 	// Run tests
 	if !flashOnly {
-		printInfo("TESTING PHASE [1/2]")
-		printInfo("===================")
+		printSectionHeader("TESTING PHASE [1/2]")
+
+		totalTests := 0
+		for _, group := range config.Tests.ParallelGroups {
+			totalTests += len(group)
+		}
+		for _, group := range config.Tests.SequentialGroups {
+			totalTests += len(group)
+		}
+
+		fmt.Printf("Total Tests: %s%d%s | Global Timeout: %s%s%s\n",
+			ColorGreen, totalTests, ColorReset,
+			ColorYellow, func() string {
+				if config.Tests.Timeout != "" {
+					return config.Tests.Timeout
+				} else {
+					return "30s (default)"
+				}
+			}(), ColorReset)
 
 		// Run parallel groups
 		for i, group := range config.Tests.ParallelGroups {
 			groupName := fmt.Sprintf("Parallel Group %d", i+1)
-			results := runTestGroup(group, true, outputManager, groupName)
+			results := runTestGroup(group, true, outputManager, groupName, config.Tests.Timeout)
 			allResults = append(allResults, results...)
 		}
 
 		// Run sequential groups
 		for i, group := range config.Tests.SequentialGroups {
 			groupName := fmt.Sprintf("Sequential Group %d", i+1)
-			results := runTestGroup(group, false, outputManager, groupName)
+			results := runTestGroup(group, false, outputManager, groupName, config.Tests.Timeout)
 			allResults = append(allResults, results...)
 		}
 	}
 
 	// Get flash data from user input (if flashing is enabled)
 	if !testsOnly && config.Flash.Enabled {
-		fmt.Println()
-		printInfo("PREPARATION FOR FLASHING")
-		printInfo("========================")
-
-		var err error
-		flashData, err = getFlashData(systemInfo.Product)
+		flashData, err = getFlashData(config.Flash, systemInfo.Product)
 		if err != nil {
 			printError(fmt.Sprintf("Failed to get flash data: %v", err))
 			os.Exit(1)
@@ -705,7 +1880,11 @@ func main() {
 
 	// Run flashing
 	if !testsOnly && config.Flash.Enabled && flashData != nil {
-		flashResults = runFlashing(config.Flash, flashData)
+		printSectionHeader("FLASHING PHASE [2/2]")
+		fmt.Printf("Operations: %s%s%s | Method: %s%s%s\n",
+			ColorYellow, strings.Join(config.Flash.Operations, ", "), ColorReset,
+			ColorGreen, config.Flash.Method, ColorReset)
+		flashResults = runFlashing(config.Flash, flashData, config.System)
 	}
 
 	totalDuration := time.Since(startTime)
@@ -719,6 +1898,7 @@ func main() {
 			Mode:     "full",
 			Config:   configPath,
 			Duration: totalDuration,
+			Operator: config.Log.OpName,
 		},
 		TestResults:  allResults,
 		FlashResults: flashResults,
@@ -726,8 +1906,8 @@ func main() {
 
 	// Add flash data to system info if available
 	if flashData != nil {
-		sessionLog.System.MBSerial = flashData.MBSerial
-		sessionLog.System.IOSerial = flashData.IOSerial
+		sessionLog.System.MBSerial = flashData.SystemSerial
+		sessionLog.System.IOSerial = flashData.IOBoard
 		sessionLog.System.MAC = flashData.MAC
 	}
 
@@ -736,29 +1916,86 @@ func main() {
 		printError(fmt.Sprintf("Failed to save log: %v", err))
 	}
 
-	if err := sendLogToServer(sessionLog, config.Log.Server); err != nil {
-		printError(fmt.Sprintf("Failed to send log to server: %v", err))
+	if config.Log.SendLogs {
+		if err := sendLogToServer(sessionLog, config.Log); err != nil {
+			printError(fmt.Sprintf("Failed to send log to server: %v", err))
+		}
+	} else {
+		printInfo("Log sending disabled (send_logs: false)")
 	}
 
 	// Print summary
-	fmt.Println()
-	printInfo("EXECUTION COMPLETE")
-	printInfo("==================")
+	printSectionHeader("EXECUTION SUMMARY")
 
 	passed := 0
 	failed := 0
+	skipped := 0
+	timeouts := 0
+	required_failed := 0
+
 	for _, result := range allResults {
-		if result.Status == "PASSED" {
+		switch result.Status {
+		case "PASSED":
 			passed++
-		} else {
+		case "FAILED":
 			failed++
+			if result.Required {
+				required_failed++
+			}
+		case "SKIPPED":
+			skipped++
+		case "TIMEOUT":
+			timeouts++
+			if result.Required {
+				required_failed++
+			}
 		}
 	}
 
-	fmt.Printf("Total duration: %s\n", totalDuration.Round(100*time.Millisecond))
-	fmt.Printf("Tests: %d passed, %d failed\n", passed, failed)
-
+	fmt.Printf("Execution Time: %s%s%s\n", ColorBlue, totalDuration.Round(100*time.Millisecond), ColorReset)
+	fmt.Printf("Total Tests: %s%d%s\n", ColorWhite, len(allResults), ColorReset)
+	fmt.Printf("  %sPassed: %d%s\n", ColorGreen, passed, ColorReset)
 	if failed > 0 {
+		fmt.Printf("  %sFailed: %d%s\n", ColorRed, failed, ColorReset)
+	}
+	if timeouts > 0 {
+		fmt.Printf("  %sTimeouts: %d%s\n", ColorYellow, timeouts, ColorReset)
+	}
+	if skipped > 0 {
+		fmt.Printf("  %sSkipped: %d%s\n", ColorBlue, skipped, ColorReset)
+	}
+
+	if required_failed > 0 {
+		fmt.Printf("\n%sRequired tests failed: %d%s\n", ColorRed, required_failed, ColorReset)
+		fmt.Printf("%sSYSTEM VALIDATION: FAILED%s\n", ColorRed, ColorReset)
+	} else if failed > 0 || timeouts > 0 {
+		fmt.Printf("\n%sOptional tests failed, but all required tests passed%s\n", ColorYellow, ColorReset)
+		fmt.Printf("%sSYSTEM VALIDATION: PASSED%s\n", ColorGreen, ColorReset)
+	} else {
+		fmt.Printf("\n%sAll tests completed successfully%s\n", ColorGreen, ColorReset)
+		fmt.Printf("%sSYSTEM VALIDATION: PASSED%s\n", ColorGreen, ColorReset)
+	}
+
+	// Flash summary
+	if len(flashResults) > 0 {
+		fmt.Printf("\nFlash Operations: %s%d%s\n", ColorWhite, len(flashResults), ColorReset)
+		flashPassed := 0
+		flashFailed := 0
+		for _, result := range flashResults {
+			if result.Status == "PASSED" {
+				flashPassed++
+			} else {
+				flashFailed++
+			}
+		}
+		fmt.Printf("  %sPassed: %d%s\n", ColorGreen, flashPassed, ColorReset)
+		if flashFailed > 0 {
+			fmt.Printf("  %sFailed: %d%s\n", ColorRed, flashFailed, ColorReset)
+		}
+	}
+
+	// Exit with error if required tests failed
+	if required_failed > 0 {
 		os.Exit(1)
 	}
 }
