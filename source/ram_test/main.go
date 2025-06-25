@@ -1001,175 +1001,132 @@ func visualizeSlots(rams []RAMInfo, config *Config) error {
 	printInfo("Memory Slots Layout:")
 	fmt.Println()
 
+	// Определяем общее число слотов
 	maxSlots := config.Visualization.TotalSlots
 	if maxSlots == 0 {
 		maxSlots = len(rams)
 	}
 
-	// Create slot data array
-	slotData := make([]RAMInfo, maxSlots+1) // +1 because slots start from 1
-	slotResults := make([]RAMCheckResult, maxSlots+1)
-
-	// Fill slots based on mapping
-	expectedSlots := make(map[int]bool)
-	for _, ram := range rams {
-		if logicalSlot, exists := config.Visualization.SlotMapping[ram.Slot]; exists {
-			if logicalSlot > 0 && logicalSlot <= maxSlots {
-				slotData[logicalSlot] = ram
-				expectedSlots[logicalSlot] = true
-			}
+	// Собираем set обязательных слотов по имени
+	required := make(map[string]bool)
+	for _, req := range config.RAMRequirements {
+		for _, slot := range req.RequiredSlots {
+			required[slot] = true
 		}
 	}
 
-	// Check overall system requirements
+	// Инвертируем SlotMapping: из позиции → в имя слота
+	posToSlot := make(map[int]string, len(config.Visualization.SlotMapping))
+	for name, pos := range config.Visualization.SlotMapping {
+		posToSlot[pos] = name
+	}
+
+	// Заполняем массив slotData по позициям
+	slotData := make([]RAMInfo, maxSlots+1)
+	for _, ram := range rams {
+		if pos, ok := config.Visualization.SlotMapping[ram.Slot]; ok && pos >= 1 && pos <= maxSlots {
+			slotData[pos] = ram
+		}
+	}
+
+	// Системная проверка для окрашивания
 	systemResult := checkRAMAgainstRequirements(rams, config)
 
-	// Set individual slot results
-	for i := 1; i <= maxSlots; i++ {
-		if slotData[i].IsPresent {
-			slotResults[i] = RAMCheckResult{Status: "ok"}
-			if systemResult.Status == "error" {
-				slotResults[i].Status = "warning" // Individual modules OK but system has issues
-			}
-		} else {
-			slotResults[i] = RAMCheckResult{Status: "empty"}
-		}
-	}
-
-	// Count status types
-	hasErrors := systemResult.Status == "error"
-	hasWarnings := systemResult.Status == "warning"
-
-	// Print legend
+	// Легенда
 	printInfo("Legend:")
-	fmt.Printf("  %s%s%s Memory Module Present  ", ColorGreen, "████", ColorReset)
-	fmt.Printf("  %s%s%s Module with Issues  ", ColorYellow, "████", ColorReset)
-	fmt.Printf("  %s%s%s Missing Module  ", ColorRed, "░░░░", ColorReset)
+	fmt.Printf("  %s%s%s Present      ", ColorGreen, "████", ColorReset)
+	fmt.Printf("  %s%s%s Issues       ", ColorYellow, "████", ColorReset)
+	fmt.Printf("  %sMISS%s Missing Req", ColorRed, ColorReset)
 	fmt.Printf("  %s%s%s Empty Slot\n", ColorWhite, "░░░░", ColorReset)
 	fmt.Println()
 
-	// Report system-level issues
-	if len(systemResult.Issues) > 0 {
-		if systemResult.Status == "error" {
-			printError("Memory configuration issues:")
-		} else if systemResult.Status == "warning" {
-			printWarning("Memory configuration warnings:")
-		}
-
-		for _, issue := range systemResult.Issues {
-			if systemResult.Status == "error" {
-				printError(fmt.Sprintf("  - %s", issue))
-			} else if systemResult.Status == "warning" {
-				printWarning(fmt.Sprintf("  - %s", issue))
-			}
-		}
-		fmt.Println()
-	}
-
-	// Calculate rows configuration
-	var rowsConfig []RowConfig
+	// Собираем ряды (custom или legacy)
+	var rows []RowConfig
 	if config.Visualization.CustomRows.Enabled && len(config.Visualization.CustomRows.Rows) > 0 {
-		// Use custom rows configuration
-		rowsConfig = config.Visualization.CustomRows.Rows
-		printDebug("Using custom rows configuration")
+		rows = config.Visualization.CustomRows.Rows
 	} else {
-		// Use legacy SlotsPerRow configuration
-		slotsPerRow := config.Visualization.SlotsPerRow
-		if slotsPerRow == 0 {
-			slotsPerRow = 8
+		perRow := config.Visualization.SlotsPerRow
+		if perRow == 0 {
+			perRow = 8
 		}
-
-		// Generate legacy rows
-		for i := 0; i < maxSlots; i += slotsPerRow {
-			end := i + slotsPerRow
+		for start := 1; start <= maxSlots; start += perRow {
+			end := start + perRow - 1
 			if end > maxSlots {
 				end = maxSlots
 			}
-			rowsConfig = append(rowsConfig, RowConfig{
-				Name:  fmt.Sprintf("Memory Bank %d", len(rowsConfig)+1),
-				Slots: fmt.Sprintf("%d-%d", i+1, end),
+			rows = append(rows, RowConfig{
+				Name:  fmt.Sprintf("Memory Bank %d", len(rows)+1),
+				Slots: fmt.Sprintf("%d-%d", start, end),
 			})
 		}
-		printDebug("Using legacy SlotsPerRow configuration")
 	}
 
-	// Process each row according to configuration
-	for rowIndex, rowConfig := range rowsConfig {
-		// Parse slot range for this row
-		startSlot, endSlot, err := parseSlotRange(rowConfig.Slots)
-		if err != nil {
-			printError(fmt.Sprintf("Invalid slot range in row %d (%s): %v", rowIndex+1, rowConfig.Name, err))
+	// Визуализация каждого ряда
+	for _, row := range rows {
+		start, end, err := parseSlotRange(row.Slots)
+		if err != nil || start < 1 || end > maxSlots {
+			printWarning(fmt.Sprintf("Skipping invalid row '%s': %v", row.Slots, err))
 			continue
 		}
-
-		// Ensure slots are within bounds
-		if startSlot > maxSlots || endSlot > maxSlots {
-			printWarning(fmt.Sprintf("Row %d (%s) slot range %s exceeds available slots (%d)",
-				rowIndex+1, rowConfig.Name, rowConfig.Slots, maxSlots))
-			continue
-		}
-
-		rowSlots := endSlot - startSlot + 1
-
-		if len(rowsConfig) > 1 {
-			fmt.Printf("%s (Slots %d-%d):\n", rowConfig.Name, startSlot, endSlot)
-		}
-
-		// Build row visualization
+		count := end - start + 1
 		width := config.Visualization.SlotWidth
+		if width < 4 {
+			width = 4
+		}
 
-		// Top border
+		// Заголовок ряда
+		if len(rows) > 1 {
+			fmt.Printf("%s (Slots %d-%d):\n", row.Name, start, end)
+		}
+
+		// Верхняя граница
 		fmt.Print("┌")
-		for i := 0; i < rowSlots; i++ {
+		for i := 0; i < count; i++ {
 			fmt.Print(strings.Repeat("─", width))
-			if i < rowSlots-1 {
+			if i < count-1 {
 				fmt.Print("┬")
 			}
 		}
 		fmt.Println("┐")
 
-		// Symbols row
+		// Строка символов
 		fmt.Print("│")
-		for i := 0; i < rowSlots; i++ {
-			slotIdx := startSlot + i
-			visual := getRAMVisual(slotData[slotIdx], &config.Visualization)
-			result := slotResults[slotIdx]
+		for i := 0; i < count; i++ {
+			idx := start + i
+			ram := slotData[idx]
 
-			symbolText := centerText(visual.Symbol, width)
-
-			if slotData[slotIdx].IsPresent {
-				switch result.Status {
-				case "ok":
-					fmt.Print(ColorGreen + symbolText + ColorReset)
-				case "warning", "error":
-					fmt.Print(ColorYellow + symbolText + ColorReset)
-				default:
-					fmt.Print(symbolText)
+			if ram.IsPresent {
+				sym := centerText("████", width)
+				if systemResult.Status == "error" {
+					fmt.Print(ColorYellow + sym + ColorReset)
+				} else {
+					fmt.Print(ColorGreen + sym + ColorReset)
 				}
 			} else {
-				fmt.Print(centerText("░░░░", width))
+				slotName := posToSlot[idx]
+				if required[slotName] {
+					miss := centerText("MISS", width)
+					fmt.Print(ColorRed + miss + ColorReset)
+				} else {
+					fmt.Print(centerText("░░░░", width))
+				}
 			}
 			fmt.Print("│")
 		}
 		fmt.Println()
 
-		// Type row
+		// Строка типов
 		fmt.Print("│")
-		for i := 0; i < rowSlots; i++ {
-			slotIdx := startSlot + i
-			result := slotResults[slotIdx]
-
-			if slotData[slotIdx].IsPresent {
-				visual := getRAMVisual(slotData[slotIdx], &config.Visualization)
-				typeText := centerText(visual.ShortName, width)
-
-				switch result.Status {
-				case "ok":
-					fmt.Print(ColorGreen + typeText + ColorReset)
-				case "warning", "error":
-					fmt.Print(ColorYellow + typeText + ColorReset)
-				default:
-					fmt.Print(typeText)
+		for i := 0; i < count; i++ {
+			idx := start + i
+			ram := slotData[idx]
+			if ram.IsPresent {
+				vis := getRAMVisual(ram, &config.Visualization)
+				txt := centerText(vis.ShortName, width)
+				if systemResult.Status == "error" {
+					fmt.Print(ColorYellow + txt + ColorReset)
+				} else {
+					fmt.Print(ColorGreen + txt + ColorReset)
 				}
 			} else {
 				fmt.Print(strings.Repeat(" ", width))
@@ -1178,29 +1135,17 @@ func visualizeSlots(rams []RAMInfo, config *Config) error {
 		}
 		fmt.Println()
 
-		// Size row
+		// Строка размеров
 		fmt.Print("│")
-		for i := 0; i < rowSlots; i++ {
-			slotIdx := startSlot + i
-			result := slotResults[slotIdx]
-
-			var sizeInfo string
-			if slotData[slotIdx].IsPresent {
-				sizeInfo = formatSize(slotData[slotIdx].SizeMB)
-			} else {
-				sizeInfo = ""
-			}
-
-			sizeText := centerText(sizeInfo, width)
-
-			if slotData[slotIdx].IsPresent {
-				switch result.Status {
-				case "ok":
-					fmt.Print(ColorGreen + sizeText + ColorReset)
-				case "warning", "error":
-					fmt.Print(ColorYellow + sizeText + ColorReset)
-				default:
-					fmt.Print(sizeText)
+		for i := 0; i < count; i++ {
+			idx := start + i
+			ram := slotData[idx]
+			if ram.IsPresent {
+				txt := centerText(formatSize(ram.SizeMB), width)
+				if systemResult.Status == "error" {
+					fmt.Print(ColorYellow + txt + ColorReset)
+				} else {
+					fmt.Print(ColorGreen + txt + ColorReset)
 				}
 			} else {
 				fmt.Print(strings.Repeat(" ", width))
@@ -1209,30 +1154,18 @@ func visualizeSlots(rams []RAMInfo, config *Config) error {
 		}
 		fmt.Println()
 
-		// Speed row (if speed checking enabled)
+		// Опциональная строка скорости
 		if config.CheckSpeed {
 			fmt.Print("│")
-			for i := 0; i < rowSlots; i++ {
-				slotIdx := startSlot + i
-				result := slotResults[slotIdx]
-
-				var speedInfo string
-				if slotData[slotIdx].IsPresent {
-					speedInfo = formatSpeed(slotData[slotIdx].Speed)
-				} else {
-					speedInfo = ""
-				}
-
-				speedText := centerText(speedInfo, width)
-
-				if slotData[slotIdx].IsPresent {
-					switch result.Status {
-					case "ok":
-						fmt.Print(ColorGreen + speedText + ColorReset)
-					case "warning", "error":
-						fmt.Print(ColorYellow + speedText + ColorReset)
-					default:
-						fmt.Print(speedText)
+			for i := 0; i < count; i++ {
+				idx := start + i
+				ram := slotData[idx]
+				if ram.IsPresent {
+					txt := centerText(formatSpeed(ram.Speed), width)
+					if systemResult.Status == "error" {
+						fmt.Print(ColorYellow + txt + ColorReset)
+					} else {
+						fmt.Print(ColorGreen + txt + ColorReset)
 					}
 				} else {
 					fmt.Print(strings.Repeat(" ", width))
@@ -1242,52 +1175,44 @@ func visualizeSlots(rams []RAMInfo, config *Config) error {
 			fmt.Println()
 		}
 
-		// Bottom border
+		// Нижняя граница
 		fmt.Print("└")
-		for i := 0; i < rowSlots; i++ {
+		for i := 0; i < count; i++ {
 			fmt.Print(strings.Repeat("─", width))
-			if i < rowSlots-1 {
+			if i < count-1 {
 				fmt.Print("┴")
 			}
 		}
 		fmt.Println("┘")
 
-		// Slot numbers
+		// Номера слотов
 		fmt.Print(" ")
-		for i := 0; i < rowSlots; i++ {
-			slotIdx := startSlot + i
-			fmt.Print(centerText(fmt.Sprintf("%d", slotIdx), width+1))
+		for i := 0; i < count; i++ {
+			fmt.Print(centerText(fmt.Sprintf("%d", start+i), width+1))
 		}
-		fmt.Println("(Slot)")
+		fmt.Println(" (Slot)")
 
-		// Slot names with shortened names
+		// Имена слотов
 		fmt.Print(" ")
-		for i := 0; i < rowSlots; i++ {
-			slotIdx := startSlot + i
-			slotName := ""
-			if slotData[slotIdx].Slot != "" {
-				slotName = shortenSlotName(slotData[slotIdx].Slot)
-			} else {
-				slotName = "-"
-			}
-			fmt.Print(centerText(slotName, width+1))
+		for i := 0; i < count; i++ {
+			name := posToSlot[start+i]
+			short := shortenSlotName(name)
+			fmt.Print(centerText(short, width+1))
 		}
-		fmt.Println("(Name)")
-
-		fmt.Println()
+		fmt.Printf(" (Name)\n\n")
 	}
 
-	// Final status
-	if hasErrors {
+	// Финальный статус
+	switch systemResult.Status {
+	case "error":
 		printError("Memory configuration validation FAILED!")
-		return fmt.Errorf("memory configuration validation failed")
-	} else if hasWarnings {
-		printWarning("Memory configuration validation completed with warnings")
-		return nil
-	} else {
+		return fmt.Errorf("validation failed")
+	case "warning":
+		printWarning("Validation completed with warnings")
+	default:
 		printSuccess("All memory modules present and meet requirements!")
-		return nil
 	}
+	return nil
 }
 
 func getRAMVisual(ram RAMInfo, config *VisualizationConfig) RAMVisual {
