@@ -244,6 +244,10 @@ func printSuccess(message string) {
 	printColored(ColorGreen, message)
 }
 
+func printWarning(message string) {
+	printColored(ColorYellow, message)
+}
+
 func printError(message string) {
 	printColored(ColorRed, message)
 }
@@ -303,6 +307,37 @@ func askUserAction(testName string) string {
 	default:
 		fmt.Printf("Invalid choice '%s', defaulting to retry.\n", choice)
 		return "RETRY"
+	}
+}
+
+func askUserProductMismatch(configProduct, detectedProduct string) bool {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Printf("\n%s⚠️  PRODUCT MISMATCH WARNING ⚠️%s\n", ColorRed, ColorReset)
+	fmt.Printf("Configuration file is designed for: %s%s%s\n", ColorYellow, configProduct, ColorReset)
+	fmt.Printf("Detected system product: %s%s%s\n", ColorYellow, detectedProduct, ColorReset)
+	fmt.Printf("\nThis configuration may not be suitable for your hardware.\n")
+	fmt.Printf("Continuing may lead to unexpected behavior or hardware damage.\n\n")
+
+	for {
+		fmt.Printf("Do you want to close the program? %s[Y/n]%s: ", ColorGreen, ColorReset)
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("%sError reading input: %v%s\n", ColorRed, err, ColorReset)
+			continue
+		}
+
+		input = strings.TrimSpace(strings.ToLower(input))
+
+		// Default is 'Y' (close program)
+		if input == "" || input == "y" || input == "yes" {
+			return true // Close program
+		} else if input == "n" || input == "no" {
+			return false // Continue
+		} else {
+			fmt.Printf("%sPlease enter 'Y' to close or 'N' to continue.%s\n", ColorRed, ColorReset)
+		}
 	}
 }
 
@@ -1093,6 +1128,40 @@ func discoverIntelNICs(venDeviceFilter []string) ([]IntelNIC, error) {
 	return filteredNICs, nil
 }
 
+// incrementMAC increases MAC address by 1 (handles hexadecimal arithmetic)
+func incrementMAC(mac string) (string, error) {
+	// Split MAC address into bytes
+	parts := strings.Split(mac, ":")
+	if len(parts) != 6 {
+		return "", fmt.Errorf("invalid MAC address format: %s", mac)
+	}
+
+	// Convert the last byte to an integer, increment it, and convert back
+	lastByte, err := strconv.ParseUint(parts[5], 16, 8)
+	if err != nil {
+		return "", fmt.Errorf("invalid MAC address byte: %s", parts[5])
+	}
+
+	// Increment with overflow handling
+	lastByte = (lastByte + 1) % 256
+
+	// If the last byte overflows, increment the previous byte
+	if lastByte == 0 {
+		fifthByte, err := strconv.ParseUint(parts[4], 16, 8)
+		if err != nil {
+			return "", fmt.Errorf("invalid MAC address byte: %s", parts[4])
+		}
+		fifthByte = (fifthByte + 1) % 256
+		parts[4] = fmt.Sprintf("%02x", fifthByte)
+	}
+
+	// Update the last byte
+	parts[5] = fmt.Sprintf("%02x", lastByte)
+
+	// Join parts back together
+	return strings.Join(parts, ":"), nil
+}
+
 func executeEeupdateFlashing(nicIndex int, targetMAC string) error {
 
 	cleanMac := strings.ReplaceAll(targetMAC, ":", "")
@@ -1211,11 +1280,21 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 	summary.NICIndices = nicIndices
 
 	printSuccess(fmt.Sprintf("Found %d Intel NIC(s) for flashing:", len(intelNICs)))
-	for _, nic := range intelNICs {
-		fmt.Printf("  NIC %d: %s (%s)\n", nic.Index, nic.VendorDevice, nic.Description)
+	for i, nic := range intelNICs {
+		// Calculate MAC for this NIC (first gets original, others get incremented)
+		currentMAC := targetMAC
+		if i > 0 {
+			for j := 0; j < i; j++ {
+				currentMAC, err = incrementMAC(currentMAC)
+				if err != nil {
+					return fmt.Errorf("failed to increment MAC address for NIC %d: %v", nic.Index, err)
+				}
+			}
+		}
+		fmt.Printf("  NIC %d: %s (%s) -> MAC: %s\n", nic.Index, nic.VendorDevice, nic.Description, currentMAC)
 	}
 
-	// Step 3: Flash each NIC
+	// Step 3: Flash each NIC with incremented MAC addresses
 	attempts := 0
 	maxAttempts := 3
 	var lastError error
@@ -1227,21 +1306,38 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 		success := true
 		flashedNICs := 0
 
-		for _, nic := range intelNICs {
-			printInfo(fmt.Sprintf("Flashing NIC %d (%s)...", nic.Index, nic.VendorDevice))
-			if err := executeEeupdateFlashing(nic.Index, targetMAC); err != nil {
+		for i, nic := range intelNICs {
+			// Calculate MAC for this NIC
+			currentMAC := targetMAC
+			if i > 0 {
+				for j := 0; j < i; j++ {
+					currentMAC, err = incrementMAC(currentMAC)
+					if err != nil {
+						lastError = fmt.Errorf("failed to increment MAC address for NIC %d: %v", nic.Index, err)
+						success = false
+						break
+					}
+				}
+			}
+
+			if !success {
+				break
+			}
+
+			printInfo(fmt.Sprintf("Flashing NIC %d (%s) with MAC %s...", nic.Index, nic.VendorDevice, currentMAC))
+			if err := executeEeupdateFlashing(nic.Index, currentMAC); err != nil {
 				printError(fmt.Sprintf("Failed to flash NIC %d: %v", nic.Index, err))
 				lastError = fmt.Errorf("failed to flash NIC %d: %v", nic.Index, err)
 				success = false
 				break
 			} else {
 				flashedNICs++
-				printSuccess(fmt.Sprintf("NIC %d flashing completed", nic.Index))
+				printSuccess(fmt.Sprintf("NIC %d flashing completed with MAC %s", nic.Index, currentMAC))
 			}
 		}
 
 		if success {
-			printSuccess(fmt.Sprintf("All %d NICs flashed successfully", flashedNICs))
+			printSuccess(fmt.Sprintf("All %d NICs flashed successfully with incremented MAC addresses", flashedNICs))
 			lastError = nil
 			break
 		}
@@ -1269,23 +1365,42 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 	}
 
 	// Step 4: Restart network and verify
-	printInfo("Restarting network services to detect new MAC...")
+	printInfo("Restarting network services to detect new MAC addresses...")
 	restartNetworkServices()
 
 	time.Sleep(3 * time.Second) // Wait for network to come up
 
+	// Step 5: Verify that at least the first MAC address is present
 	printInfo("Verifying MAC address presence...")
 	newInterfaces, err := getCurrentNetworkInterfaces()
 	if err != nil {
 		printError(fmt.Sprintf("Warning: failed to verify MAC flashing: %v", err))
 	} else {
+		// Check for the primary MAC address (first one)
 		exists, interfaceName := isTargetMACPresent(targetMAC, newInterfaces)
 		if exists {
 			summary.Success = true
 			summary.InterfaceName = interfaceName
-			printSuccess(fmt.Sprintf("SUCCESS: MAC %s found on interface %s", targetMAC, interfaceName))
+			printSuccess(fmt.Sprintf("SUCCESS: Primary MAC %s found on interface %s", targetMAC, interfaceName))
 
-			// Try to restore IP address
+			// Also check for incremented MAC addresses and report them
+			currentMAC := targetMAC
+			for i := 1; i < len(intelNICs); i++ {
+				currentMAC, err = incrementMAC(currentMAC)
+				if err != nil {
+					printError(fmt.Sprintf("Warning: failed to increment MAC for verification: %v", err))
+					break
+				}
+
+				exists, ifaceName := isTargetMACPresent(currentMAC, newInterfaces)
+				if exists {
+					printSuccess(fmt.Sprintf("Additional MAC %s found on interface %s", currentMAC, ifaceName))
+				} else {
+					printError(fmt.Sprintf("Warning: Expected MAC %s not found on any interface", currentMAC))
+				}
+			}
+
+			// Try to restore IP address to the primary interface
 			if originalIP != "" {
 				printInfo(fmt.Sprintf("Restoring original IP address: %s", originalIP))
 				if err := restoreIPAddress(interfaceName, originalIP); err != nil {
@@ -1295,7 +1410,7 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 				}
 			}
 		} else {
-			printError("MAC not found on any interface after flashing")
+			printError("Primary MAC not found on any interface after flashing")
 			action := askFlashRetryAction(fmt.Sprintf("Flashing completed but target MAC %s not found on any interface", targetMAC))
 			if action == "SKIP" {
 				summary.Success = false
@@ -1946,6 +2061,28 @@ func main() {
 	fmt.Printf("Board Serial: %s%s%s\n", ColorGreen, systemInfo.MBSerial, ColorReset)
 	fmt.Printf("IP Address: %s%s%s\n", ColorGreen, systemInfo.IP, ColorReset)
 	fmt.Printf("Detection Time: %s%s%s\n", ColorBlue, systemInfo.Timestamp.Format("2006-01-02 15:04:05"), ColorReset)
+
+	// Check product compatibility
+	if config.System.Product != "" && systemInfo.Product != "" {
+		if config.System.Product != systemInfo.Product {
+			if askUserProductMismatch(config.System.Product, systemInfo.Product) {
+				printInfo("Program terminated by user due to product mismatch")
+				os.Exit(0)
+			} else {
+				printWarning("Continuing with mismatched product configuration")
+				printWarning("Use at your own risk!")
+			}
+		} else {
+			printSuccess("Product configuration matches detected hardware")
+		}
+	} else {
+		if config.System.Product == "" {
+			printWarning("No product specified in configuration")
+		}
+		if systemInfo.Product == "" {
+			printWarning("Could not detect system product name")
+		}
+	}
 
 	// Test server connection early if log sending is enabled
 	if config.Log.SendLogs {
