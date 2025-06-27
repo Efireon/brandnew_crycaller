@@ -1,6 +1,7 @@
 # Конфигурация для Firestarter
 system:
   product: "SP2C621D32TM3"                              # Продукт, на который расчитана данная конфигурация
+  manufacturer: "INFERIT"                               # Вендор продукта
   require_root: true                                    # Требовать root привилегии
   guid_prefix: "8be4df61-93ca-11d2-aa0d-00e098032b8c"   # GUID префикс для EFI переменных
   efi_sn_name: "SerialNumber"                           # Имя EFI переменной для серийного номера
