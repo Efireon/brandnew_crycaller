@@ -58,6 +58,7 @@ flash:
     - "serial"  # Прошивка серийных номеров
     - "mac"     # Прошивка MAC адресов
     - "efi"     # Запись EFI переменных
+    - "fru"     # Прошивка чипа FRU
   fields:
     - name: "System serial"
       flash: true                                     # Требуется ли его прошивать
@@ -72,7 +73,7 @@ flash:
     - name: "MAC address"
       flash: true
       id: "mac_address"
-      regex: "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"   # Поле для MAC адреса
+      regex: "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"   # Поле для MAC адреса      
 
   method: "eeupdate"                                  # Метод прошивки (rtnicpg/eeupdate) на основе продукта
   ven_device: ["8086-1521"]                           # Указатель конкретной карты для прошивки

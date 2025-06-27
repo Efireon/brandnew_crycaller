@@ -114,22 +114,29 @@ type TestResult struct {
 }
 
 type SystemInfo struct {
-	Product   string                 `yaml:"product"`
-	MBSerial  string                 `yaml:"mb_serial,omitempty"`
-	IOSerial  string                 `yaml:"io_serial,omitempty"`
-	MAC       string                 `yaml:"mac,omitempty"`
-	IP        string                 `yaml:"ip,omitempty"`
-	Timestamp time.Time              `yaml:"timestamp"`
+	Product   string    `yaml:"product"`
+	MBSerial  string    `yaml:"mb_serial,omitempty"` // Прошитый серийник материнской платы
+	IOSerial  string    `yaml:"io_serial,omitempty"` // Прошитый серийник IO платы
+	MAC       string    `yaml:"mac,omitempty"`       // Прошитый MAC адрес
+	IP        string    `yaml:"ip,omitempty"`
+	Timestamp time.Time `yaml:"timestamp"`
+
+	// Оригинальные значения (до прошивки)
+	OriginalMBSerial string   `yaml:"original_mb_serial,omitempty"` // Оригинальный серийник материнской платы
+	OriginalMACs     []string `yaml:"original_macs,omitempty"`      // Список всех оригинальных MAC адресов
+
+	// DMIDecode данные в конце для лучшей читаемости
 	DMIDecode map[string]interface{} `yaml:"dmidecode"`
 }
 
+// Обновленная структура SessionLog - тесты перенесены ближе к началу
 type SessionLog struct {
 	SessionID    string        `yaml:"session"`
 	Timestamp    time.Time     `yaml:"timestamp"`
-	System       SystemInfo    `yaml:"system"`
 	Pipeline     PipelineInfo  `yaml:"pipeline"`
-	TestResults  []TestResult  `yaml:"test_results"`
+	TestResults  []TestResult  `yaml:"test_results"` // Перенесено выше
 	FlashResults []FlashResult `yaml:"flash_results,omitempty"`
+	System       SystemInfo    `yaml:"system"` // Перенесено ниже тестов
 }
 
 type PipelineInfo struct {
@@ -469,6 +476,10 @@ func printInfo(message string) {
 
 func printSuccess(message string) {
 	printColored(ColorGreen, message)
+}
+
+func printWarning(message string) {
+	printColored(ColorYellow, message)
 }
 
 func printError(message string) {
@@ -1003,6 +1014,28 @@ func getSystemInfo() (SystemInfo, error) {
 		info.IP = ip
 	}
 
+	// Get original MAC addresses from all network interfaces
+	if interfaces, err := getCurrentNetworkInterfaces(); err == nil {
+		var originalMACs []string
+		for _, iface := range interfaces {
+			if iface.MAC != "" && iface.Name != "lo" { // Исключаем loopback
+				// Нормализуем MAC для единообразия
+				normalizedMAC := normalizeMAC(iface.MAC)
+				if normalizedMAC != "" {
+					originalMACs = append(originalMACs, normalizedMAC)
+				}
+			}
+		}
+		info.OriginalMACs = originalMACs
+
+		if len(originalMACs) > 0 {
+			printInfo(fmt.Sprintf("Collected %d original MAC address(es): %s",
+				len(originalMACs), strings.Join(originalMACs, ", ")))
+		}
+	} else {
+		printWarning(fmt.Sprintf("Failed to collect original MAC addresses: %v", err))
+	}
+
 	// Run dmidecode
 	cmd := exec.Command("dmidecode")
 	output, err := cmd.Output()
@@ -1014,7 +1047,7 @@ func getSystemInfo() (SystemInfo, error) {
 	dmidecodeData := parseDMIDecode(string(output))
 	info.DMIDecode = dmidecodeData
 
-	// Extract key information
+	// Extract key information and save original values
 	if systemInfo, ok := dmidecodeData["System Information"].(map[string]interface{}); ok {
 		if product, ok := systemInfo["Product Name"].(string); ok {
 			info.Product = product
@@ -1023,7 +1056,8 @@ func getSystemInfo() (SystemInfo, error) {
 
 	if baseboardInfo, ok := dmidecodeData["Base Board Information"].(map[string]interface{}); ok {
 		if serial, ok := baseboardInfo["Serial Number"].(string); ok {
-			info.MBSerial = serial
+			info.OriginalMBSerial = serial // Сохраняем оригинальный серийник
+			printInfo(fmt.Sprintf("Original motherboard serial: %s", serial))
 		}
 	}
 
@@ -1184,6 +1218,64 @@ func getInterfaceDriver(interfaceName string) (string, error) {
 	return "", fmt.Errorf("driver not found for interface %s", interfaceName)
 }
 
+func getIntelNetworkDrivers() ([]string, error) {
+	printInfo("Detecting Intel network drivers...")
+
+	// Получаем список всех Intel сетевых карт через lspci
+	cmd := exec.Command("lspci", "-nn", "-d", "8086:")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run lspci: %v", err)
+	}
+
+	var drivers []string
+	driverSet := make(map[string]bool) // Для удаления дубликатов
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		// Ищем сетевые контроллеры (Ethernet controller, Network controller)
+		if strings.Contains(strings.ToLower(line), "ethernet") ||
+			strings.Contains(strings.ToLower(line), "network") {
+
+			// Извлекаем PCI адрес (первая часть строки до пробела)
+			parts := strings.Fields(line)
+			if len(parts) == 0 {
+				continue
+			}
+			pciAddr := parts[0]
+
+			// Получаем драйвер для этого устройства
+			driverPath := fmt.Sprintf("/sys/bus/pci/devices/0000:%s/driver", pciAddr)
+			if link, err := os.Readlink(driverPath); err == nil {
+				driverName := filepath.Base(link)
+				if !driverSet[driverName] {
+					drivers = append(drivers, driverName)
+					driverSet[driverName] = true
+					printInfo(fmt.Sprintf("Found Intel driver: %s (PCI: %s)", driverName, pciAddr))
+				}
+			}
+		}
+	}
+
+	if len(drivers) == 0 {
+		printWarning("No Intel network drivers found, trying common drivers...")
+		// Fallback к общим Intel драйверам
+		commonDrivers := []string{"igb", "e1000e", "ixgbe", "i40e", "ice"}
+		for _, driver := range commonDrivers {
+			// Проверяем, загружен ли драйвер
+			cmd := exec.Command("lsmod")
+			output, err := cmd.Output()
+			if err == nil && strings.Contains(string(output), driver) {
+				drivers = append(drivers, driver)
+				printInfo(fmt.Sprintf("Found loaded Intel driver: %s", driver))
+			}
+		}
+	}
+
+	printSuccess(fmt.Sprintf("Detected %d Intel network driver(s)", len(drivers)))
+	return drivers, nil
+}
+
 func normalizeMAC(mac string) string {
 	// Remove any separators and convert to uppercase
 	mac = strings.ReplaceAll(mac, ":", "")
@@ -1252,10 +1344,18 @@ func flashMAC(flashConfig FlashConfig, systemConfig SystemConfig, mac string) er
 
 	printSubHeader("MAC ADDRESS FLASHING", fmt.Sprintf("Method: %s | Target MAC: %s", method, mac))
 
-	// Step 1: Get current network interfaces
+	// Step 1: Get current network interfaces and save original MACs
 	interfaces, err := getCurrentNetworkInterfaces()
 	if err != nil {
 		return fmt.Errorf("failed to get network interfaces: %v", err)
+	}
+
+	// Log original MAC addresses before flashing
+	printInfo("Original MAC addresses before flashing:")
+	for _, iface := range interfaces {
+		if iface.MAC != "" && iface.Name != "lo" {
+			printInfo(fmt.Sprintf("  %s: %s [%s]", iface.Name, iface.MAC, iface.Driver))
+		}
 	}
 
 	// Step 2: Check if target MAC already exists
@@ -1524,7 +1624,14 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 		printInfo(fmt.Sprintf("Current IP address saved: %s", originalIP))
 	}
 
-	// Step 2: Discover Intel NICs with optional filtering
+	// Step 2: Get Intel network drivers before discovery
+	intelDrivers, err := getIntelNetworkDrivers()
+	if err != nil {
+		printWarning(fmt.Sprintf("Failed to detect Intel drivers: %v", err))
+		intelDrivers = []string{"igb"} // Fallback к наиболее распространенному
+	}
+
+	// Step 3: Discover Intel NICs with optional filtering
 	printInfo("Scanning for Intel network cards...")
 	intelNICs, err := discoverIntelNICs(flashConfig.VenDevice)
 	if err != nil {
@@ -1557,7 +1664,20 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 		fmt.Printf("  NIC %d: %s (%s) -> MAC: %s\n", nic.Index, nic.VendorDevice, nic.Description, currentMAC)
 	}
 
-	// Step 3: Flash each NIC with incremented MAC addresses
+	// Step 4: Unload Intel drivers before flashing
+	printInfo("Unloading Intel network drivers for flashing...")
+	for _, driver := range intelDrivers {
+		if err := unloadNetworkDriver(driver); err != nil {
+			printWarning(fmt.Sprintf("Failed to unload driver %s: %v", driver, err))
+		} else {
+			printSuccess(fmt.Sprintf("Driver %s unloaded successfully", driver))
+		}
+	}
+
+	// Wait for drivers to fully unload
+	time.Sleep(2 * time.Second)
+
+	// Step 5: Flash each NIC with incremented MAC addresses
 	attempts := 0
 	maxAttempts := 3
 	var lastError error
@@ -1610,11 +1730,15 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 			if action == "SKIP" {
 				summary.Success = false
 				summary.Error = "Skipped by operator"
+				// Reload drivers before exiting
+				reloadIntelDrivers(intelDrivers)
 				return nil
 			}
 			if action == "ABORT" {
 				summary.Success = false
 				summary.Error = fmt.Sprintf("Aborted by operator after %d attempts", attempts)
+				// Reload drivers before exiting
+				reloadIntelDrivers(intelDrivers)
 				return fmt.Errorf("flashing aborted by operator")
 			}
 			// Continue to retry if action == "RETRY"
@@ -1624,16 +1748,19 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 	if lastError != nil && attempts >= maxAttempts {
 		summary.Success = false
 		summary.Error = fmt.Sprintf("Max attempts reached: %v", lastError)
+		// Reload drivers before exiting
+		reloadIntelDrivers(intelDrivers)
 		return lastError
 	}
 
-	// Step 4: Restart network and verify
-	printInfo("Restarting network services to detect new MAC addresses...")
-	restartNetworkServices()
+	// Step 6: Reload Intel drivers after flashing
+	printInfo("Reloading Intel network drivers...")
+	reloadIntelDrivers(intelDrivers)
 
-	time.Sleep(3 * time.Second) // Wait for network to come up
+	// Wait for drivers to fully load and interfaces to come up
+	time.Sleep(5 * time.Second)
 
-	// Step 5: Verify that at least the first MAC address is present
+	// Step 7: Verify that at least the first MAC address is present
 	printInfo("Verifying MAC address presence...")
 	newInterfaces, err := getCurrentNetworkInterfaces()
 	if err != nil {
@@ -1818,6 +1945,17 @@ func unloadNetworkDriver(driverName string) error {
 	return nil
 }
 
+func reloadIntelDrivers(drivers []string) {
+	for _, driver := range drivers {
+		if err := loadNetworkDriver(driver); err != nil {
+			printWarning(fmt.Sprintf("Failed to reload driver %s: %v", driver, err))
+		} else {
+			printSuccess(fmt.Sprintf("Driver %s reloaded successfully", driver))
+		}
+		time.Sleep(1 * time.Second) // Небольшая пауза между загрузкой драйверов
+	}
+}
+
 func loadNetworkDriver(driverName string) error {
 	if driverName == "" {
 		return fmt.Errorf("driver name is empty")
@@ -1925,41 +2063,6 @@ func executeRtnicFlashing(targetMAC string) error {
 	return nil
 }
 
-// Network restoration functions
-func restartNetworkServices() {
-	printInfo("Restarting network services...")
-
-	// Try different network restart methods
-	methods := [][]string{
-		{"systemctl", "restart", "networking"},
-		{"systemctl", "restart", "network"},
-		{"service", "networking", "restart"},
-		{"service", "network", "restart"},
-	}
-
-	for _, method := range methods {
-		cmd := exec.Command(method[0], method[1:]...)
-		if err := cmd.Run(); err == nil {
-			printSuccess(fmt.Sprintf("Network restarted using: %s", strings.Join(method, " ")))
-			time.Sleep(3 * time.Second)
-			return
-		}
-	}
-
-	// Fallback: restart network interfaces manually
-	printInfo("Fallback: restarting network interfaces manually...")
-	interfaces, _ := getCurrentNetworkInterfaces()
-	for _, iface := range interfaces {
-		if iface.Name != "lo" {
-			exec.Command("ip", "link", "set", iface.Name, "down").Run()
-			time.Sleep(1 * time.Second)
-			exec.Command("ip", "link", "set", iface.Name, "up").Run()
-		}
-	}
-
-	time.Sleep(3 * time.Second)
-}
-
 func restoreIPAddress(interfaceName, ipAddress string) error {
 	if interfaceName == "" || ipAddress == "" {
 		return fmt.Errorf("interface name or IP address is empty")
@@ -1999,6 +2102,18 @@ func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemCo
 	}
 
 	fmt.Println(strings.Repeat("-", 80))
+
+	// Логируем то, что будем прошивать
+	printInfo("Flashing operations summary:")
+	if flashData.SystemSerial != "" {
+		printInfo(fmt.Sprintf("  System Serial -> %s", flashData.SystemSerial))
+	}
+	if flashData.IOBoard != "" {
+		printInfo(fmt.Sprintf("  IO Board      -> %s", flashData.IOBoard))
+	}
+	if flashData.MAC != "" {
+		printInfo(fmt.Sprintf("  MAC Address   -> %s", flashData.MAC))
+	}
 
 	for _, operation := range config.Operations {
 		result := FlashResult{
@@ -2430,16 +2545,35 @@ func main() {
 	sessionLog := SessionLog{
 		SessionID:    fmt.Sprintf("%d", time.Now().Unix()),
 		Timestamp:    sessionStart,
-		System:       systemInfo,
 		Pipeline:     PipelineInfo{Mode: "full", Config: configPath, Duration: totalDuration, Operator: config.Log.OpName},
-		TestResults:  allResults,
+		TestResults:  allResults, // Перенесено выше системной информации
 		FlashResults: flashResults,
+		System:       systemInfo, // Остается внизу, но выше dmidecode
 	}
+
 	if flashData != nil {
-		sessionLog.System.MBSerial = flashData.SystemSerial
-		sessionLog.System.IOSerial = flashData.IOBoard
-		sessionLog.System.MAC = flashData.MAC
+		// Прошитые значения записываем в основные поля
+		if flashData.SystemSerial != "" {
+			sessionLog.System.MBSerial = flashData.SystemSerial
+		}
+		if flashData.IOBoard != "" {
+			sessionLog.System.IOSerial = flashData.IOBoard
+		}
+		if flashData.MAC != "" {
+			sessionLog.System.MAC = flashData.MAC
+		}
+
+		printInfo("Log will include both original and flashed values")
+		printInfo(fmt.Sprintf("  Original MB Serial: %s -> Flashed: %s",
+			sessionLog.System.OriginalMBSerial, sessionLog.System.MBSerial))
+		if len(sessionLog.System.OriginalMACs) > 0 {
+			printInfo(fmt.Sprintf("  Original MACs: %s -> Flashed: %s",
+				strings.Join(sessionLog.System.OriginalMACs, ", "), sessionLog.System.MAC))
+		}
+	} else {
+		printInfo("No flashing performed - only original values will be logged")
 	}
+
 	if err := saveLog(sessionLog, config.Log); err != nil {
 		printError(fmt.Sprintf("Failed to save log: %v", err))
 	}
