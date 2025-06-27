@@ -48,12 +48,13 @@ type Config struct {
 }
 
 type SystemConfig struct {
-	Product     string `yaml:"product"`
-	RequireRoot bool   `yaml:"require_root"`
-	GuidPrefix  string `yaml:"guid_prefix"`
-	EfiSnName   string `yaml:"efi_sn_name"`
-	EfiMacName  string `yaml:"efi_mac_name"`
-	DriverDir   string `yaml:"driver_dir"`
+	Product      string `yaml:"product"`
+	Manufacturer string `yaml:"manufacturer"`
+	RequireRoot  bool   `yaml:"require_root"`
+	GuidPrefix   string `yaml:"guid_prefix"`
+	EfiSnName    string `yaml:"efi_sn_name"`
+	EfiMacName   string `yaml:"efi_mac_name"`
+	DriverDir    string `yaml:"driver_dir"`
 }
 
 type TestsConfig struct {
@@ -100,6 +101,14 @@ type FlashData struct {
 	SystemSerial string
 	IOBoard      string
 	MAC          string
+}
+
+type FRUStatus struct {
+	IsPresent    bool
+	IsEmpty      bool
+	HasBadSum    bool
+	CanRead      bool
+	ErrorMessage string
 }
 
 // Result structures
@@ -2156,6 +2165,21 @@ func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemCo
 				result.Status = "FAILED"
 				result.Details = fmt.Sprintf("EFI update failed: %v", err)
 			}
+
+		case "fru":
+			printInfo("Flashing FRU chip...")
+			if flashData.SystemSerial != "" {
+				err := flashFRU(systemConfig, flashData.SystemSerial)
+				if err != nil {
+					result.Status = "FAILED"
+					result.Details = fmt.Sprintf("FRU flash failed: %v", err)
+				} else {
+					printSuccess("FRU chip flashed successfully")
+				}
+			} else {
+				result.Status = "FAILED"
+				result.Details = "No system serial number provided for FRU flashing"
+			}
 		}
 
 		result.Duration = time.Since(startTime)
@@ -2373,6 +2397,389 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 	return nil
 }
 
+func checkFRUStatus() (*FRUStatus, error) {
+	printInfo("Checking FRU chip status...")
+
+	status := &FRUStatus{}
+
+	// Try to read FRU data using ipmitool
+	cmd := exec.Command("ipmitool", "fru", "print", "0")
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		printWarning(fmt.Sprintf("FRU read returned error: %v", err))
+		status.CanRead = false
+		status.ErrorMessage = err.Error()
+
+		// Check specific error patterns that indicate FRU needs initialization
+		outputLower := strings.ToLower(outputStr)
+
+		if strings.Contains(outputLower, "unknown fru header version") {
+			status.IsEmpty = true
+			status.HasBadSum = true // Corrupted header also needs blank flash
+			printWarning("FRU has corrupted header (Unknown FRU header version) - needs initialization")
+		} else if strings.Contains(outputLower, "no fru data") ||
+			strings.Contains(outputLower, "invalid") ||
+			strings.Contains(outputLower, "empty") {
+			status.IsEmpty = true
+			printWarning("FRU appears to be empty")
+		} else if strings.Contains(outputLower, "checksum") ||
+			strings.Contains(outputLower, "badchecksum") {
+			status.HasBadSum = true
+			printWarning("FRU has bad checksum")
+		} else if strings.Contains(outputLower, "fru read failed") ||
+			strings.Contains(outputLower, "fru data checksum") {
+			status.HasBadSum = true
+			printWarning("FRU data corruption detected")
+		} else {
+			// For any other FRU read error, assume it needs reinitialization
+			status.IsEmpty = true
+			status.HasBadSum = true
+			printWarning(fmt.Sprintf("FRU read failed with unknown error - assuming corruption: %s", outputStr))
+		}
+	} else {
+		status.CanRead = true
+		status.IsPresent = true
+
+		// Check if FRU has actual valid data
+		if strings.Contains(outputStr, "Board Mfg") ||
+			strings.Contains(outputStr, "Board Product") ||
+			strings.Contains(outputStr, "Board Serial") {
+			printSuccess("FRU contains valid data")
+		} else {
+			status.IsEmpty = true
+			printInfo("FRU is readable but appears empty")
+		}
+	}
+
+	// Summary of status
+	if status.IsEmpty && status.HasBadSum {
+		printInfo("FRU Status: Corrupted/Empty - requires blank initialization")
+	} else if status.IsEmpty {
+		printInfo("FRU Status: Empty - requires initialization")
+	} else if status.HasBadSum {
+		printInfo("FRU Status: Bad checksum - requires reinitialization")
+	} else if status.CanRead {
+		printInfo("FRU Status: Valid data present")
+	}
+
+	return status, nil
+}
+
+func createFRUBlankFile() (string, error) {
+	printInfo("Creating blank FRU file (2048 null bytes - equivalent to 'dd if=/dev/zero bs=2048 count=1')...")
+
+	tmpFile, err := os.CreateTemp("", "fru_blank_*.bin")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer tmpFile.Close()
+
+	// Write 2048 null bytes (same as dd if=/dev/zero of=file bs=2048 count=1)
+	nullData := make([]byte, 2048)
+	bytesWritten, err := tmpFile.Write(nullData)
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write blank data: %v", err)
+	}
+
+	if bytesWritten != 2048 {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("wrote %d bytes, expected 2048", bytesWritten)
+	}
+
+	printSuccess(fmt.Sprintf("Blank FRU file created: %s (%d bytes)", tmpFile.Name(), bytesWritten))
+	return tmpFile.Name(), nil
+}
+
+func flashFRUFile(filename string) error {
+	printInfo(fmt.Sprintf("Flashing FRU file: %s", filename))
+
+	// Use ipmitool to write FRU file
+	cmd := exec.Command("ipmitool", "fru", "write", "0", filename)
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		return fmt.Errorf("FRU flash failed: %v\nOutput: %s", err, outputStr)
+	}
+
+	// Check for success indicators in output
+	if strings.Contains(strings.ToLower(outputStr), "success") ||
+		strings.Contains(strings.ToLower(outputStr), "written") ||
+		len(outputStr) == 0 { // Sometimes ipmitool outputs nothing on success
+		printSuccess("FRU file flashed successfully")
+		return nil
+	}
+
+	// Check for error indicators
+	if strings.Contains(strings.ToLower(outputStr), "error") ||
+		strings.Contains(strings.ToLower(outputStr), "fail") {
+		return fmt.Errorf("FRU flash reported error: %s", outputStr)
+	}
+
+	// If no clear indicators, assume success (some ipmitool versions are quiet)
+	printSuccess("FRU flash command completed")
+	return nil
+}
+
+func generateFRUFile(systemConfig SystemConfig, serialNumber string) (string, error) {
+	printInfo("Generating FRU file with frugen...")
+
+	// Create temporary file for FRU output
+	tmpFile, err := os.CreateTemp("", "fru_generated_*.bin")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close() // Close it so frugen can write to it
+
+	// Prepare frugen command
+	manufacturer := systemConfig.Manufacturer
+	if manufacturer == "" {
+		manufacturer = "Unknown" // fallback
+	}
+
+	product := systemConfig.Product
+	if product == "" {
+		product = "Unknown" // fallback
+	}
+
+	cmd := exec.Command("frugen",
+		"--board-mfg", manufacturer,
+		"--board-pname", product,
+		"--board-serial", serialNumber,
+		"--ascii",
+		tmpFile.Name())
+
+	printInfo(fmt.Sprintf("Executing: frugen --board-mfg \"%s\" --board-pname \"%s\" --board-serial \"%s\" --ascii %s",
+		manufacturer, product, serialNumber, tmpFile.Name()))
+
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("frugen failed: %v\nOutput: %s", err, outputStr)
+	}
+
+	// Check if file was actually created
+	if _, err := os.Stat(tmpFile.Name()); os.IsNotExist(err) {
+		return "", fmt.Errorf("frugen did not create output file")
+	}
+
+	printSuccess(fmt.Sprintf("FRU file generated: %s", tmpFile.Name()))
+	if outputStr != "" {
+		printInfo(fmt.Sprintf("frugen output: %s", outputStr))
+	}
+
+	return tmpFile.Name(), nil
+}
+
+func verifyFRUData(expectedManufacturer, expectedProduct, expectedSerial string) error {
+	printInfo("Verifying FRU data...")
+
+	// Wait a moment for FRU to be readable after flashing
+	time.Sleep(2 * time.Second)
+
+	cmd := exec.Command("ipmitool", "fru", "print", "0")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to read FRU for verification: %v", err)
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	var foundMfg, foundProduct, foundSerial string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "Board Mfg") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				foundMfg = strings.TrimSpace(parts[1])
+			}
+		} else if strings.HasPrefix(line, "Board Product") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				foundProduct = strings.TrimSpace(parts[1])
+			}
+		} else if strings.HasPrefix(line, "Board Serial") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				foundSerial = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	// Check each field
+	var errors []string
+
+	if foundMfg != expectedManufacturer {
+		errors = append(errors, fmt.Sprintf("Manufacturer mismatch: expected '%s', found '%s'", expectedManufacturer, foundMfg))
+	}
+
+	if foundProduct != expectedProduct {
+		errors = append(errors, fmt.Sprintf("Product mismatch: expected '%s', found '%s'", expectedProduct, foundProduct))
+	}
+
+	if foundSerial != expectedSerial {
+		errors = append(errors, fmt.Sprintf("Serial mismatch: expected '%s', found '%s'", expectedSerial, foundSerial))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("FRU verification failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+
+	printSuccess("FRU verification passed")
+	printInfo(fmt.Sprintf("  Manufacturer: %s", foundMfg))
+	printInfo(fmt.Sprintf("  Product: %s", foundProduct))
+	printInfo(fmt.Sprintf("  Serial: %s", foundSerial))
+
+	return nil
+}
+
+func askFRURetryAction(message string) string {
+	fmt.Printf("\n%s=== FRU FLASHING ERROR ===%s\n", ColorRed, ColorReset)
+	fmt.Printf("%s\n", message)
+	fmt.Println("Choose action:")
+	fmt.Printf("  %s[Y]%s Yes - Retry FRU flashing (default)\n", ColorGreen, ColorReset)
+	fmt.Printf("  %s[A]%s Abort - Stop FRU flashing and continue program\n", ColorYellow, ColorReset)
+	fmt.Printf("  %s[S]%s Skip - Skip FRU flashing by operator decision\n", ColorBlue, ColorReset)
+	fmt.Printf("Choice [Y/a/s]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "RETRY" // default on error
+	}
+
+	choice := strings.ToUpper(strings.TrimSpace(input))
+	if choice == "" {
+		choice = "Y" // default
+	}
+
+	switch choice {
+	case "Y", "YES":
+		return "RETRY"
+	case "A", "ABORT":
+		return "ABORT"
+	case "S", "SKIP":
+		return "SKIP"
+	default:
+		fmt.Printf("Invalid choice '%s', defaulting to retry.\n", choice)
+		return "RETRY"
+	}
+}
+
+func flashFRU(systemConfig SystemConfig, serialNumber string) error {
+	printSubHeader("FRU CHIP FLASHING", fmt.Sprintf("Target Serial: %s | Manufacturer: %s", serialNumber, systemConfig.Manufacturer))
+
+	// Step 1: Check current FRU status
+	status, err := checkFRUStatus()
+	if err != nil {
+		return fmt.Errorf("failed to check FRU status: %v", err)
+	}
+
+	// Step 2: If FRU has bad checksum or is empty, flash blank first
+	needsBlankFlash := status.HasBadSum || status.IsEmpty || !status.CanRead
+
+	if needsBlankFlash {
+		if status.HasBadSum && status.IsEmpty {
+			printInfo("FRU has corrupted header - initializing with blank data...")
+		} else if status.HasBadSum {
+			printInfo("FRU has bad checksum - clearing with blank data...")
+		} else if status.IsEmpty {
+			printInfo("FRU is empty - initializing with blank data...")
+		} else {
+			printInfo("FRU is unreadable - clearing with blank data...")
+		}
+
+		blankFile, err := createFRUBlankFile()
+		if err != nil {
+			return fmt.Errorf("failed to create blank FRU file: %v", err)
+		}
+		defer os.Remove(blankFile)
+
+		printInfo("Flashing 2048-byte null file to clear FRU...")
+		if err := flashFRUFile(blankFile); err != nil {
+			return fmt.Errorf("failed to flash blank FRU: %v", err)
+		}
+
+		printSuccess("Blank FRU flash completed")
+
+		// Wait for FRU to be ready after blank flash
+		printInfo("Waiting for FRU to stabilize...")
+		time.Sleep(3 * time.Second)
+
+		// Verify blank flash worked by trying to read FRU again
+		printInfo("Verifying blank flash...")
+		newStatus, err := checkFRUStatus()
+		if err == nil && newStatus.CanRead {
+			printSuccess("FRU is now ready for data programming")
+		} else {
+			printWarning("FRU still has issues after blank flash, but continuing...")
+		}
+	} else {
+		printInfo("FRU is readable and has valid data - skipping blank flash")
+	}
+
+	// Step 3: Generate and flash FRU with retries
+	attempts := 0
+	maxAttempts := 3
+	var lastError error
+
+	for attempts < maxAttempts {
+		attempts++
+		printInfo(fmt.Sprintf("FRU generation and flashing attempt %d/%d...", attempts, maxAttempts))
+
+		// Generate FRU file
+		fruFile, err := generateFRUFile(systemConfig, serialNumber)
+		if err != nil {
+			lastError = fmt.Errorf("FRU generation failed: %v", err)
+			printError(lastError.Error())
+		} else {
+			defer os.Remove(fruFile)
+
+			// Flash FRU file
+			if err := flashFRUFile(fruFile); err != nil {
+				lastError = fmt.Errorf("FRU flashing failed: %v", err)
+				printError(lastError.Error())
+			} else {
+				// Verify FRU data
+				if err := verifyFRUData(systemConfig.Manufacturer, systemConfig.Product, serialNumber); err != nil {
+					lastError = fmt.Errorf("FRU verification failed: %v", err)
+					printError(lastError.Error())
+				} else {
+					// Success!
+					printSuccess("FRU flashing completed successfully")
+					return nil
+				}
+			}
+		}
+
+		// If we failed and have more attempts, ask user what to do
+		if attempts < maxAttempts {
+			action := askFRURetryAction(fmt.Sprintf("FRU flashing failed (attempt %d/%d): %v", attempts, maxAttempts, lastError))
+			switch action {
+			case "SKIP":
+				printWarning("FRU flashing skipped by operator")
+				return nil
+			case "ABORT":
+				return fmt.Errorf("FRU flashing aborted by operator")
+			case "RETRY":
+				printInfo("Retrying FRU flashing...")
+				continue
+			}
+		}
+	}
+
+	// All attempts failed
+	return fmt.Errorf("FRU flashing failed after %d attempts: %v", maxAttempts, lastError)
+}
+
 func main() {
 	var configPath string
 	var showVersion bool
@@ -2415,6 +2822,7 @@ func main() {
 	// System configuration display
 	fmt.Printf("\n%sSYSTEM CONFIGURATION%s\n", ColorWhite, ColorReset)
 	fmt.Printf("  Target Product    : %s%s%s\n", ColorCyan, config.System.Product, ColorReset)
+	fmt.Printf("  Manufacturer      : %s%s%s\n", ColorCyan, config.System.Manufacturer, ColorReset) // ДОБАВИТЬ ЭТУ СТРОКУ
 	fmt.Printf("  Configuration     : %s%s%s\n", ColorYellow, configPath, ColorReset)
 	fmt.Printf("  Root Required     : %s%v%s\n", ColorYellow, config.System.RequireRoot, ColorReset)
 	fmt.Printf("  Driver Directory  : %s%s%s\n", ColorBlue, config.System.DriverDir, ColorReset)
