@@ -289,6 +289,7 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 			disk.Interface = "USB"
 			disk.Type = "USB"
 			disk.IsRemovable = true
+			disk.SmartStatus = "N/A" // Явно устанавливаем N/A для USB
 		case "scsi":
 			disk.Interface = "SCSI"
 		default:
@@ -299,6 +300,7 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 	// Определяем removable устройства
 	if device.RM != nil && *device.RM {
 		disk.IsRemovable = true
+		disk.SmartStatus = "N/A" // Явно устанавливаем N/A для removable
 		if disk.Type == "" || disk.Type == "Unknown" {
 			disk.Type = "USB"
 			disk.Interface = "USB"
@@ -319,6 +321,11 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 		disk.Type = "Unknown"
 	}
 
+	// Убеждаемся, что для USB устройств SMART = N/A
+	if disk.Type == "USB" || disk.Interface == "USB" || disk.IsRemovable {
+		disk.SmartStatus = "N/A"
+	}
+
 	if device.Mountpoint != nil && *device.Mountpoint != "" {
 		disk.MountPoints = append(disk.MountPoints, *device.Mountpoint)
 	}
@@ -330,8 +337,8 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 	}
 
 	if debugMode {
-		printDebug(fmt.Sprintf("Parsed lsblk device %s: Type=%s, Interface=%s, Removable=%t, Transport=%v",
-			device.Kname, disk.Type, disk.Interface, disk.IsRemovable,
+		printDebug(fmt.Sprintf("Parsed lsblk device %s: Type=%s, Interface=%s, Removable=%t, SMART=%s, Transport=%v",
+			device.Kname, disk.Type, disk.Interface, disk.IsRemovable, disk.SmartStatus,
 			func() string {
 				if device.Tran != nil {
 					return *device.Tran
@@ -1263,23 +1270,106 @@ func checkSlotForVisualization(disk DiskInfo, config *Config) SlotCheckResult {
 		TempOK:   true,
 	}
 
-	// Основные проверки здоровья диска
-	if config.CheckSmart && disk.SmartStatus == "FAILED" {
-		result.Issues = append(result.Issues, "SMART health failed")
-		result.HealthOK = false
-		result.Status = "error"
-	} else if config.CheckSmart && disk.SmartStatus == "N/A" {
-		result.Issues = append(result.Issues, "SMART unavailable")
-		result.HealthWarn = true
-		if result.Status == "ok" {
-			result.Status = "warning"
+	// Находим требования, которые применимы к этому диску
+	var applicableReqs []SlotRequirement
+	for _, req := range config.SlotRequirements {
+		// Проверяем, попадает ли диск под это требование
+		if len(req.RequiredSlots) > 0 {
+			for _, slotNum := range req.RequiredSlots {
+				if disk.LogicalSlot == slotNum {
+					applicableReqs = append(applicableReqs, req)
+					break
+				}
+			}
+		}
+		if len(req.OptionalSlots) > 0 {
+			for _, slotNum := range req.OptionalSlots {
+				if disk.LogicalSlot == slotNum {
+					applicableReqs = append(applicableReqs, req)
+					break
+				}
+			}
 		}
 	}
 
-	if config.CheckTemp && disk.Temperature > 70 {
-		result.Issues = append(result.Issues, fmt.Sprintf("High temperature: %d°C", disk.Temperature))
-		result.TempOK = false
-		result.Status = "error"
+	// Применяем проверки из найденных требований
+	for _, req := range applicableReqs {
+		// Проверка типа
+		if req.RequiredType != "" && req.RequiredType != "any" && disk.Type != req.RequiredType {
+			result.Issues = append(result.Issues,
+				fmt.Sprintf("Type mismatch: %s (required %s)", disk.Type, req.RequiredType))
+			result.TypeOK = false
+			result.Status = "error"
+		}
+
+		// Проверка размера - ЭТО БЫЛО ПРОПУЩЕНО!
+		if req.MinSizeGB > 0 && disk.SizeGB < req.MinSizeGB {
+			result.Issues = append(result.Issues,
+				fmt.Sprintf("Size too small: %dGB (min %dGB)", disk.SizeGB, req.MinSizeGB))
+			result.SizeOK = false
+			result.Status = "error"
+		}
+
+		if req.MaxSizeGB > 0 && disk.SizeGB > req.MaxSizeGB {
+			result.Issues = append(result.Issues,
+				fmt.Sprintf("Size too large: %dGB (max %dGB)", disk.SizeGB, req.MaxSizeGB))
+			result.SizeOK = false
+			result.Status = "error"
+		}
+
+		// Проверка здоровья
+		if config.CheckSmart && req.RequireHealth && shouldCheckSMART(disk) {
+			if disk.SmartStatus == "FAILED" {
+				result.Issues = append(result.Issues, "SMART health failed")
+				result.HealthOK = false
+				result.Status = "error"
+			} else if disk.SmartStatus == "N/A" {
+				result.Issues = append(result.Issues, "SMART unavailable")
+				result.HealthWarn = true
+				if result.Status == "ok" {
+					result.Status = "warning"
+				}
+			}
+		}
+
+		// Проверка температуры
+		if config.CheckTemp && req.MaxTempC > 0 && disk.Temperature > 0 {
+			if disk.Temperature > req.MaxTempC {
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("High temperature: %d°C (max %d°C)", disk.Temperature, req.MaxTempC))
+				result.TempOK = false
+				result.Status = "error"
+			}
+		}
+	}
+
+	// Общие проверки без требований (для случаев когда нет специфических требований)
+	if len(applicableReqs) == 0 {
+		// Основные проверки здоровья диска для USB устройств НЕ проверяем SMART
+		if config.CheckSmart && shouldCheckSMART(disk) && disk.SmartStatus == "FAILED" {
+			result.Issues = append(result.Issues, "SMART health failed")
+			result.HealthOK = false
+			result.Status = "error"
+		} else if config.CheckSmart && shouldCheckSMART(disk) && disk.SmartStatus == "N/A" {
+			result.Issues = append(result.Issues, "SMART unavailable")
+			result.HealthWarn = true
+			if result.Status == "ok" {
+				result.Status = "warning"
+			}
+		}
+
+		// Общая проверка температуры (если диск не USB и температура слишком высокая)
+		if config.CheckTemp && disk.Temperature > 70 && shouldCheckSMART(disk) {
+			result.Issues = append(result.Issues, fmt.Sprintf("High temperature: %d°C", disk.Temperature))
+			result.TempOK = false
+			result.Status = "error"
+		}
+	}
+
+	// Дополнительная отладочная информация для USB устройств
+	if debugMode && (disk.Type == "USB" || disk.IsRemovable) {
+		printDebug(fmt.Sprintf("USB/Removable device %s: SMART check skipped, Type=%s, Interface=%s, Removable=%t",
+			disk.Device, disk.Type, disk.Interface, disk.IsRemovable))
 	}
 
 	return result
@@ -1401,7 +1491,7 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 		}
 		fmt.Println()
 
-		// Дополнительные ряды если включены
+		// Ряд температуры (если включен)
 		if config.Visualization.ShowTemp {
 			fmt.Print("│")
 			for i := 0; i < rowSlots; i++ {
@@ -1409,7 +1499,8 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 				result := slotResults[slotIdx]
 
 				if slotData[slotIdx].Device != "" {
-					tempText := centerText(formatTemp(slotData[slotIdx].Temperature), width)
+					// Используем обновленную функцию formatTemp с проверкой USB
+					tempText := centerText(formatTemp(slotData[slotIdx].Temperature, slotData[slotIdx].Type, slotData[slotIdx].IsRemovable), width)
 
 					switch result.Status {
 					case "ok":
@@ -1420,6 +1511,45 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 						fmt.Print(ColorRed + tempText + ColorReset)
 					default:
 						fmt.Print(tempText)
+					}
+				} else {
+					// Для пустых слотов
+					switch result.Status {
+					case "error":
+						fmt.Print(ColorRed + centerText("ERR", width) + ColorReset)
+					default:
+						fmt.Print(strings.Repeat(" ", width))
+					}
+				}
+				fmt.Print("│")
+			}
+			fmt.Println()
+		}
+
+		// Ряд SMART статуса (если включен)
+		if config.Visualization.ShowSmart {
+			fmt.Print("│")
+			for i := 0; i < rowSlots; i++ {
+				slotIdx := rowStart + i
+				result := slotResults[slotIdx]
+
+				if slotData[slotIdx].Device != "" {
+					// Используем новую функцию formatSmart с проверкой USB
+					smartText := centerText(formatSmart(slotData[slotIdx].SmartStatus, slotData[slotIdx].Type, slotData[slotIdx].IsRemovable), width)
+
+					// Цветовое кодирование SMART статуса
+					smartStatus := formatSmart(slotData[slotIdx].SmartStatus, slotData[slotIdx].Type, slotData[slotIdx].IsRemovable)
+					if smartStatus == "N/A" {
+						// Серый цвет для N/A (USB устройства)
+						fmt.Print(ColorWhite + smartText + ColorReset)
+					} else if smartStatus == "FAIL" || (result.Status == "error" && !result.HealthOK) {
+						fmt.Print(ColorRed + smartText + ColorReset)
+					} else if smartStatus == "OK" && result.Status == "ok" {
+						fmt.Print(ColorGreen + smartText + ColorReset)
+					} else if result.Status == "warning" || result.HealthWarn {
+						fmt.Print(ColorYellow + smartText + ColorReset)
+					} else {
+						fmt.Print(smartText)
 					}
 				} else {
 					// Для пустых слотов
@@ -1521,16 +1651,19 @@ func createDefaultConfig(configPath string) error {
 	for _, disk := range disks {
 		slotMapping[disk.PhysicalSlot] = disk.LogicalSlot
 		expectedSlots[disk.LogicalSlot] = true
-		printInfo(fmt.Sprintf("  Slot %d (%s): %s (%s, %dGB)",
-			disk.LogicalSlot, disk.PhysicalSlot, disk.CleanID, disk.Type, disk.SizeGB))
+		printInfo(fmt.Sprintf("  Slot %d (%s): %s (%s, %dGB, SMART: %s)",
+			disk.LogicalSlot, disk.PhysicalSlot, disk.CleanID, disk.Type, disk.SizeGB, disk.SmartStatus))
 	}
 
-	// Проверяем SMART
+	// Проверяем SMART - исключаем USB устройства
 	globalHasHealth := false
+	smartCapableDevices := 0
 	for _, disk := range disks {
-		if disk.SmartStatus == "PASSED" {
-			globalHasHealth = true
-			break
+		if shouldCheckSMART(disk) {
+			smartCapableDevices++
+			if disk.SmartStatus == "PASSED" {
+				globalHasHealth = true
+			}
 		}
 	}
 
@@ -1550,12 +1683,15 @@ func createDefaultConfig(configPath string) error {
 			}
 		}
 
+		// Для USB устройств не требуем SMART проверки
+		requireHealth := globalHasHealth && diskType != "USB" && shouldCheckSMART(disksOfType[0])
+
 		req := SlotRequirement{
 			Name:          fmt.Sprintf("%s slots (%d required)", diskType, len(disksOfType)),
 			MinOccupied:   len(disksOfType),
 			RequiredType:  diskType,
 			MinSizeGB:     minSize,
-			RequireHealth: globalHasHealth && shouldCheckSMART(disksOfType[0]),
+			RequireHealth: requireHealth,
 			MaxTempC:      70,
 			RequiredSlots: requiredSlots, // Конкретные слоты, которые должны быть заняты
 			AllowEmpty:    false,         // Не разрешаем пустые обязательные слоты
@@ -1591,7 +1727,7 @@ func createDefaultConfig(configPath string) error {
 			SlotWidth:   12,
 			SlotsPerRow: 6,
 			ShowTemp:    true,
-			ShowSmart:   true,
+			ShowSmart:   smartCapableDevices > 0, // Показываем SMART только если есть устройства с поддержкой
 		},
 		CheckSmart:   globalHasHealth,
 		CheckTemp:    true,
@@ -1617,7 +1753,11 @@ func createDefaultConfig(configPath string) error {
 	printInfo(fmt.Sprintf("Total slots configured: %d", len(disks)))
 	printInfo("Configuration will detect missing disks in required slots")
 	if globalHasHealth {
-		printInfo("SMART checking enabled")
+		printInfo(fmt.Sprintf("SMART checking enabled (%d SMART-capable devices)", smartCapableDevices))
+	} else if smartCapableDevices > 0 {
+		printWarning(fmt.Sprintf("SMART available but no healthy devices detected (%d SMART-capable devices)", smartCapableDevices))
+	} else {
+		printInfo("No SMART-capable devices found (USB devices don't support SMART)")
 	}
 
 	// Сохраняем информацию о физическом мапировании для отладки
@@ -1664,8 +1804,24 @@ func enrichDiskInfo(disk DiskInfo) DiskInfo {
 	// Получаем точки монтирования
 	disk.MountPoints = getMountPoints(disk.Device)
 
+	// Дополнительная проверка на USB через by-path
+	if disk.ByPathPath == "" {
+		disk.ByPathPath = findByPathForDevice(disk.Device)
+	}
+	if strings.Contains(strings.ToLower(disk.ByPathPath), "usb") {
+		disk.Type = "USB"
+		disk.Interface = "USB"
+		disk.SmartStatus = "N/A"
+		disk.IsRemovable = true
+	}
+
 	// SMART данные - пропускаем для USB и других removable устройств
 	if shouldCheckSMART(disk) {
+		if debugMode {
+			printDebug(fmt.Sprintf("Checking SMART for %s (Type: %s, Interface: %s, Removable: %t)",
+				disk.Device, disk.Type, disk.Interface, disk.IsRemovable))
+		}
+
 		if smart, err := getSmartInfo(disk.Device); err == nil {
 			disk.SmartStatus = smart.Status
 			disk.Temperature = smart.Temperature
@@ -1684,10 +1840,11 @@ func enrichDiskInfo(disk DiskInfo) DiskInfo {
 			}
 		}
 	} else {
+		// Явно устанавливаем N/A для USB и других removable устройств
 		disk.SmartStatus = "N/A"
 		if debugMode {
-			printDebug(fmt.Sprintf("Skipping SMART for %s (Type: %s, Removable: %t)",
-				disk.Device, disk.Type, disk.IsRemovable))
+			printDebug(fmt.Sprintf("Skipping SMART for %s (Type: %s, Interface: %s, Removable: %t) - Setting SMART to N/A",
+				disk.Device, disk.Type, disk.Interface, disk.IsRemovable))
 		}
 	}
 
@@ -1696,8 +1853,8 @@ func enrichDiskInfo(disk DiskInfo) DiskInfo {
 
 // shouldCheckSMART определяет, нужно ли проверять SMART для данного диска
 func shouldCheckSMART(disk DiskInfo) bool {
-	// Пропускаем SMART для USB устройств
-	if disk.Type == "USB" || disk.IsRemovable {
+	// Пропускаем SMART для USB устройств (по типу и интерфейсу)
+	if disk.Type == "USB" || disk.Interface == "USB" || disk.IsRemovable {
 		return false
 	}
 
@@ -1707,14 +1864,18 @@ func shouldCheckSMART(disk DiskInfo) bool {
 	}
 
 	// Пропускаем для MMC/SD карт
-	if strings.Contains(disk.Device, "mmcblk") {
+	if strings.Contains(disk.Device, "mmcblk") || disk.Type == "MMC" {
 		return false
 	}
 
-	// Проверяем SMART для SATA, NVMe, SSD, HDD
-	return disk.Type == "SATA" || disk.Type == "NVMe" || disk.Type == "SSD" || disk.Type == "HDD"
-}
+	// Дополнительная проверка по пути - если в by-path есть USB, то точно USB
+	if strings.Contains(strings.ToLower(disk.ByPathPath), "usb") {
+		return false
+	}
 
+	// Проверяем SMART только для стационарных дисков
+	return disk.Type == "SATA" || disk.Type == "NVMe" || disk.Type == "SSD" || disk.Type == "HDD" || disk.Interface == "SATA" || disk.Interface == "NVMe"
+}
 func getDiskSizeFromDevice(device string) int {
 	deviceName := filepath.Base(device)
 	sizePath := fmt.Sprintf("/sys/block/%s/size", deviceName)
@@ -1758,29 +1919,37 @@ func enrichFromSysBlock(disk DiskInfo) DiskInfo {
 		disk.Serial = strings.TrimSpace(serial)
 	}
 
-	// Определяем тип и интерфейс только если они еще не определены
-	if disk.Type == "" || disk.Type == "Unknown" {
-		disk.Type = determineDiskTypeFromSys(deviceName, sysPath)
+	// Проверяем removable СНАЧАЛА
+	if removable, err := readSysFile(sysPath + "/removable"); err == nil {
+		disk.IsRemovable = strings.TrimSpace(removable) == "1"
 	}
 
-	if disk.Interface == "" {
-		disk.Interface = determineInterface(deviceName, sysPath)
-	}
-
-	// Проверяем removable только если еще не определено
-	if !disk.IsRemovable {
-		if removable, err := readSysFile(sysPath + "/removable"); err == nil {
-			disk.IsRemovable = strings.TrimSpace(removable) == "1"
-			// Если removable и тип не определен, это скорее всего USB
-			if disk.IsRemovable && (disk.Type == "" || disk.Type == "Unknown") {
-				disk.Type = "USB"
-				disk.Interface = "USB"
-			}
+	// Проверяем USB по device path в sysfs
+	if devicePath, err := os.Readlink(sysPath + "/device"); err == nil {
+		if strings.Contains(devicePath, "usb") {
+			disk.IsRemovable = true
+			disk.Type = "USB"
+			disk.Interface = "USB"
 		}
 	}
 
-	// Получаем rotation speed только для HDD
-	if disk.Type == "HDD" {
+	// Если removable и тип еще не определен как USB, то это USB
+	if disk.IsRemovable && disk.Type != "USB" {
+		disk.Type = "USB"
+		disk.Interface = "USB"
+	}
+
+	// Определяем тип и интерфейс только если они еще не определены и это не USB
+	if (disk.Type == "" || disk.Type == "Unknown") && !disk.IsRemovable && disk.Type != "USB" {
+		disk.Type = determineDiskTypeFromSys(deviceName, sysPath)
+	}
+
+	if disk.Interface == "" && !disk.IsRemovable && disk.Type != "USB" {
+		disk.Interface = determineInterface(deviceName, sysPath)
+	}
+
+	// Получаем rotation speed только для HDD (не USB)
+	if disk.Type == "HDD" && !disk.IsRemovable {
 		if rotational, err := readSysFile(sysPath + "/queue/rotational"); err == nil {
 			if strings.TrimSpace(rotational) == "1" {
 				if rate, err := readSysFile(sysPath + "/device/rotation_rate"); err == nil {
@@ -1838,6 +2007,28 @@ func determineDiskTypeFromSys(deviceName, sysPath string) string {
 	}
 
 	return "Unknown"
+}
+
+func formatSmart(smartStatus string, diskType string, isRemovable bool) string {
+	// Для USB и removable устройств всегда показываем N/A
+	if diskType == "USB" || isRemovable || smartStatus == "N/A" {
+		return "N/A"
+	}
+
+	// Для других устройств показываем реальный статус или ? если не определен
+	if smartStatus == "" {
+		return "?"
+	}
+
+	// Сокращаем длинные статусы для помещения в ячейку
+	switch strings.ToUpper(smartStatus) {
+	case "PASSED":
+		return "OK"
+	case "FAILED":
+		return "FAIL"
+	default:
+		return smartStatus
+	}
 }
 
 func determineInterface(deviceName, sysPath string) string {
@@ -2185,7 +2376,12 @@ func formatSize(sizeGB int) string {
 	}
 }
 
-func formatTemp(temp int) string {
+func formatTemp(temp int, diskType string, isRemovable bool) string {
+	// Для USB и removable устройств показываем N/A
+	if diskType == "USB" || isRemovable {
+		return "N/A"
+	}
+
 	if temp == 0 {
 		return "?"
 	}
@@ -2242,8 +2438,8 @@ func main() {
 				fmt.Printf("  Vendor: %s\n", disk.Vendor)
 				fmt.Printf("  Firmware: %s\n", disk.Firmware)
 				fmt.Printf("  Rotation Speed: %d RPM\n", disk.RotSpeed)
-				fmt.Printf("  Temperature: %s\n", formatTemp(disk.Temperature))
-				fmt.Printf("  SMART Status: %s\n", disk.SmartStatus)
+				fmt.Printf("  Temperature: %s\n", formatTemp(disk.Temperature, disk.Type, disk.IsRemovable))
+				fmt.Printf("  SMART Status: %s\n", formatSmart(disk.SmartStatus, disk.Type, disk.IsRemovable))
 				fmt.Printf("  Power-On Hours: %d\n", disk.PowerOnHrs)
 				fmt.Printf("  Power Cycles: %d\n", disk.PowerCycles)
 				fmt.Printf("  Removable: %t\n", disk.IsRemovable)
