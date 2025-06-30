@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-const VERSION = "1.1.0"
+const VERSION = "1.1.1"
 
 type DiskInfo struct {
 	Device       string   `json:"device"`        // Current device path (e.g., /dev/sda)
@@ -173,8 +173,8 @@ func getDiskInfo() ([]DiskInfo, error) {
 		disks[i] = determinePhysicalSlot(disks[i])
 		disks[i].CleanID = cleanIdentifier(disks[i].ByIdPath)
 
-		printDebug(fmt.Sprintf("  After enrichment: Type=%s, Interface=%s, PhysicalSlot=%s, SMART=%s",
-			disks[i].Type, disks[i].Interface, disks[i].PhysicalSlot, disks[i].SmartStatus))
+		printDebug(fmt.Sprintf("  After enrichment: Type=%s, Interface=%s, PhysicalSlot=%s, SMART=%s, Temp=%d°C",
+			disks[i].Type, disks[i].Interface, disks[i].PhysicalSlot, disks[i].SmartStatus, disks[i].Temperature))
 	}
 
 	// Сортируем по физическим слотам и назначаем логические слоты
@@ -186,8 +186,8 @@ func getDiskInfo() ([]DiskInfo, error) {
 	if debugMode {
 		printDebug("Final disk list:")
 		for _, disk := range disks {
-			printDebug(fmt.Sprintf("  Slot %d: %s -> %s (%s, %dGB, %s)",
-				disk.LogicalSlot, disk.PhysicalSlot, disk.Device, disk.Type, disk.SizeGB, disk.SmartStatus))
+			printDebug(fmt.Sprintf("  Slot %d: %s -> %s (%s, %dGB, %s, %d°C)",
+				disk.LogicalSlot, disk.PhysicalSlot, disk.Device, disk.Type, disk.SizeGB, disk.SmartStatus, disk.Temperature))
 		}
 	}
 
@@ -226,8 +226,8 @@ type LsblkDevice struct {
 	WWN        *string       `json:"wwn"`
 	Vendor     *string       `json:"vendor"`
 	Tran       *string       `json:"tran"`
-	Rota       *string       `json:"rota"`
-	RM         *string       `json:"rm"`
+	Rota       *bool         `json:"rota"`
+	RM         *bool         `json:"rm"`
 	Kname      string        `json:"kname"`
 	Pkname     *string       `json:"pkname"`
 	Children   []LsblkDevice `json:"children,omitempty"`
@@ -272,8 +272,13 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 
 	disk.SizeGB = parseSizeFromLsblk(device.Size)
 
-	// Сначала определяем интерфейс и тип по transport
-	if device.Tran != nil {
+	// Улучшенное определение типа и интерфейса
+	// Сначала проверяем имя устройства на NVMe
+	if strings.Contains(device.Kname, "nvme") {
+		disk.Type = "NVMe"
+		disk.Interface = "NVMe"
+	} else if device.Tran != nil {
+		// Затем определяем по transport
 		switch strings.ToLower(*device.Tran) {
 		case "nvme":
 			disk.Interface = "NVMe"
@@ -292,7 +297,7 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 	}
 
 	// Определяем removable устройства
-	if device.RM != nil && *device.RM == "1" {
+	if device.RM != nil && *device.RM {
 		disk.IsRemovable = true
 		if disk.Type == "" || disk.Type == "Unknown" {
 			disk.Type = "USB"
@@ -300,17 +305,11 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 		}
 	}
 
-	// Дополнительная проверка по имени устройства для NVMe
-	if strings.Contains(device.Kname, "nvme") {
-		disk.Type = "NVMe"
-		disk.Interface = "NVMe"
-	}
-
 	// Определяем тип диска по rotation только если тип еще не определен
 	if disk.Type == "" || disk.Type == "Unknown" {
-		if device.Rota != nil && *device.Rota == "0" {
+		if device.Rota != nil && !*device.Rota {
 			disk.Type = "SSD"
-		} else if device.Rota != nil && *device.Rota == "1" {
+		} else if device.Rota != nil && *device.Rota {
 			disk.Type = "HDD"
 		}
 	}
@@ -1950,6 +1949,7 @@ func parseSmartOutput(output string) SmartData {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
+		// Проверяем общее состояние SMART
 		if strings.Contains(line, "SMART overall-health") {
 			if strings.Contains(line, "PASSED") {
 				smart.Status = "PASSED"
@@ -1958,20 +1958,22 @@ func parseSmartOutput(output string) SmartData {
 			}
 		}
 
-		if strings.Contains(line, "Temperature_Celsius") || strings.Contains(line, "Current Drive Temperature") {
-			if temp := extractNumber(line); temp > 0 && temp < 200 {
-				smart.Temperature = temp
-			}
+		// Парсим температуру для разных типов дисков
+		if temp := parseTemperature(line); temp > 0 {
+			smart.Temperature = temp
 		}
 
+		// Power-on hours
 		if strings.Contains(line, "Power_On_Hours") {
-			smart.PowerOnHours = extractNumber(line)
+			smart.PowerOnHours = extractSMARTValue(line)
 		}
 
+		// Power cycle count
 		if strings.Contains(line, "Power_Cycle_Count") {
-			smart.PowerCycles = extractNumber(line)
+			smart.PowerCycles = extractSMARTValue(line)
 		}
 
+		// Firmware version
 		if strings.Contains(line, "Firmware Version:") {
 			parts := strings.Split(line, ":")
 			if len(parts) > 1 {
@@ -1979,6 +1981,7 @@ func parseSmartOutput(output string) SmartData {
 			}
 		}
 
+		// Rotation rate
 		if strings.Contains(line, "Rotation Rate:") {
 			if strings.Contains(line, "Solid State Device") {
 				smart.RotationRate = 0
@@ -1989,6 +1992,80 @@ func parseSmartOutput(output string) SmartData {
 	}
 
 	return smart
+}
+
+// parseTemperature улучшенная функция для парсинга температуры
+func parseTemperature(line string) int {
+	lineLower := strings.ToLower(line)
+
+	// Для NVMe дисков
+	if strings.Contains(lineLower, "temperature:") && !strings.Contains(lineLower, "sensor") {
+		// Ищем "Temperature: 45 Celsius" или "Temperature: 45 C"
+		re := regexp.MustCompile(`temperature:\s*(\d+)\s*(celsius|c)?`)
+		if matches := re.FindStringSubmatch(lineLower); len(matches) >= 2 {
+			if temp, err := strconv.Atoi(matches[1]); err == nil && temp > 0 && temp < 200 {
+				return temp
+			}
+		}
+	}
+
+	// Для NVMe температурных сенсоров
+	if strings.Contains(lineLower, "temperature sensor") && strings.Contains(lineLower, "celsius") {
+		// "Temperature Sensor 1: 45 Celsius"
+		re := regexp.MustCompile(`temperature sensor \d+:\s*(\d+)\s*celsius`)
+		if matches := re.FindStringSubmatch(lineLower); len(matches) >= 2 {
+			if temp, err := strconv.Atoi(matches[1]); err == nil && temp > 0 && temp < 200 {
+				return temp
+			}
+		}
+	}
+
+	// Для SATA дисков - ищем атрибут Temperature_Celsius
+	if strings.Contains(line, "Temperature_Celsius") {
+		// Формат: "194 Temperature_Celsius     0x0022   100   100   000    Old_age   Always       -       28 (Min/Max 21/42)"
+		// Температура обычно после последнего тире
+		parts := strings.Split(line, "-")
+		if len(parts) > 1 {
+			lastPart := strings.TrimSpace(parts[len(parts)-1])
+			// Извлекаем первое число из последней части
+			re := regexp.MustCompile(`^(\d+)`)
+			if matches := re.FindStringSubmatch(lastPart); len(matches) >= 2 {
+				if temp, err := strconv.Atoi(matches[1]); err == nil && temp > 0 && temp < 200 {
+					return temp
+				}
+			}
+		}
+	}
+
+	// Другие форматы температуры
+	if strings.Contains(lineLower, "current drive temperature") {
+		re := regexp.MustCompile(`(\d+)\s*(degrees|c|celsius)?`)
+		if matches := re.FindStringSubmatch(lineLower); len(matches) >= 2 {
+			if temp, err := strconv.Atoi(matches[1]); err == nil && temp > 0 && temp < 200 {
+				return temp
+			}
+		}
+	}
+
+	return 0
+}
+
+// extractSMARTValue извлекает значение из строки SMART атрибута
+func extractSMARTValue(line string) int {
+	// Для строк вида: "  9 Power_On_Hours          0x0032   099   099   000    Old_age   Always       -       1234"
+	// Нужно взять последнее число после тире
+	parts := strings.Split(line, "-")
+	if len(parts) > 1 {
+		lastPart := strings.TrimSpace(parts[len(parts)-1])
+		// Извлекаем первое число
+		re := regexp.MustCompile(`(\d+)`)
+		if matches := re.FindStringSubmatch(lastPart); len(matches) >= 2 {
+			if value, err := strconv.Atoi(matches[1]); err == nil {
+				return value
+			}
+		}
+	}
+	return 0
 }
 
 func extractNumber(line string) int {
