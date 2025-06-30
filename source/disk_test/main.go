@@ -152,6 +152,7 @@ func getDiskInfo() ([]DiskInfo, error) {
 		printDebug(fmt.Sprintf("lsblk failed: %v, trying fallback methods", err))
 		disks, err = getDisksFromByPath()
 		if err != nil {
+			printDebug(fmt.Sprintf("by-path failed: %v, trying proc/partitions", err))
 			return getDisksFromProcPartitions()
 		}
 	}
@@ -160,17 +161,36 @@ func getDiskInfo() ([]DiskInfo, error) {
 		return nil, fmt.Errorf("no disks found")
 	}
 
+	printDebug(fmt.Sprintf("Found %d raw disks before enrichment:", len(disks)))
+	for i, disk := range disks {
+		printDebug(fmt.Sprintf("  Raw disk %d: %s (Type: %s, Size: %dGB)", i+1, disk.Device, disk.Type, disk.SizeGB))
+	}
+
 	// Обогащаем информацию и определяем физические слоты
 	for i := range disks {
+		printDebug(fmt.Sprintf("Enriching disk %s...", disks[i].Device))
 		disks[i] = enrichDiskInfo(disks[i])
 		disks[i] = determinePhysicalSlot(disks[i])
 		disks[i].CleanID = cleanIdentifier(disks[i].ByIdPath)
+
+		printDebug(fmt.Sprintf("  After enrichment: Type=%s, Interface=%s, PhysicalSlot=%s, SMART=%s",
+			disks[i].Type, disks[i].Interface, disks[i].PhysicalSlot, disks[i].SmartStatus))
 	}
 
 	// Сортируем по физическим слотам и назначаем логические слоты
 	disks = assignLogicalSlots(disks)
 
 	printInfo(fmt.Sprintf("Detected %d disks in physical slots", len(disks)))
+
+	// Показываем итоговый список для отладки
+	if debugMode {
+		printDebug("Final disk list:")
+		for _, disk := range disks {
+			printDebug(fmt.Sprintf("  Slot %d: %s -> %s (%s, %dGB, %s)",
+				disk.LogicalSlot, disk.PhysicalSlot, disk.Device, disk.Type, disk.SizeGB, disk.SmartStatus))
+		}
+	}
+
 	return disks, nil
 }
 
@@ -252,12 +272,7 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 
 	disk.SizeGB = parseSizeFromLsblk(device.Size)
 
-	if device.Rota != nil && *device.Rota == "0" {
-		disk.Type = "SSD"
-	} else if device.Rota != nil && *device.Rota == "1" {
-		disk.Type = "HDD"
-	}
-
+	// Сначала определяем интерфейс и тип по transport
 	if device.Tran != nil {
 		switch strings.ToLower(*device.Tran) {
 		case "nvme":
@@ -268,6 +283,7 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 		case "usb":
 			disk.Interface = "USB"
 			disk.Type = "USB"
+			disk.IsRemovable = true
 		case "scsi":
 			disk.Interface = "SCSI"
 		default:
@@ -275,13 +291,31 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 		}
 	}
 
+	// Определяем removable устройства
 	if device.RM != nil && *device.RM == "1" {
 		disk.IsRemovable = true
-		if disk.Type == "" {
+		if disk.Type == "" || disk.Type == "Unknown" {
 			disk.Type = "USB"
+			disk.Interface = "USB"
 		}
 	}
 
+	// Дополнительная проверка по имени устройства для NVMe
+	if strings.Contains(device.Kname, "nvme") {
+		disk.Type = "NVMe"
+		disk.Interface = "NVMe"
+	}
+
+	// Определяем тип диска по rotation только если тип еще не определен
+	if disk.Type == "" || disk.Type == "Unknown" {
+		if device.Rota != nil && *device.Rota == "0" {
+			disk.Type = "SSD"
+		} else if device.Rota != nil && *device.Rota == "1" {
+			disk.Type = "HDD"
+		}
+	}
+
+	// Финальная проверка
 	if disk.Type == "" {
 		disk.Type = "Unknown"
 	}
@@ -294,6 +328,18 @@ func parseLsblkDevice(device LsblkDevice) DiskInfo {
 		if child.Mountpoint != nil && *child.Mountpoint != "" {
 			disk.MountPoints = append(disk.MountPoints, *child.Mountpoint)
 		}
+	}
+
+	if debugMode {
+		printDebug(fmt.Sprintf("Parsed lsblk device %s: Type=%s, Interface=%s, Removable=%t, Transport=%v",
+			device.Kname, disk.Type, disk.Interface, disk.IsRemovable,
+			func() string {
+				if device.Tran != nil {
+					return *device.Tran
+				} else {
+					return "nil"
+				}
+			}()))
 	}
 
 	return disk
@@ -340,12 +386,312 @@ func parseSizeFromLsblk(sizeStr string) int {
 	}
 }
 
+// ===== FALLBACK ФУНКЦИИ =====
+
+func getDisksFromByPath() ([]DiskInfo, error) {
+	printDebug("Trying by-path detection method...")
+
+	byPathDir := "/dev/disk/by-path"
+	if _, err := os.Stat(byPathDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("by-path directory not found")
+	}
+
+	entries, err := os.ReadDir(byPathDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read by-path directory: %v", err)
+	}
+
+	var disks []DiskInfo
+	processedDevices := make(map[string]bool)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		// Пропускаем разделы
+		if isPartitionByPathName(entry.Name()) {
+			continue
+		}
+
+		pathLink := filepath.Join(byPathDir, entry.Name())
+		realDevice, err := filepath.EvalSymlinks(pathLink)
+		if err != nil {
+			printDebug(fmt.Sprintf("Failed to resolve symlink %s: %v", pathLink, err))
+			continue
+		}
+
+		if processedDevices[realDevice] {
+			continue
+		}
+
+		if !isBlockDevice(realDevice) {
+			continue
+		}
+
+		disk := DiskInfo{
+			Device:     realDevice,
+			ByPathPath: pathLink,
+		}
+
+		// Предварительное определение типа по пути
+		disk.Type = determineTypeFromPath(pathLink)
+		disk.Interface = determineInterfaceFromPath(pathLink)
+		if disk.Type == "USB" {
+			disk.IsRemovable = true
+		}
+
+		disk = enrichDiskInfo(disk)
+		disk.PhysicalSlot = extractPhysicalSlotFromPath(pathLink)
+		disk.CleanID = cleanIdentifier(disk.ByIdPath)
+
+		disks = append(disks, disk)
+		processedDevices[realDevice] = true
+
+		printDebug(fmt.Sprintf("Found disk via by-path: %s -> %s (Type: %s)", pathLink, realDevice, disk.Type))
+	}
+
+	if len(disks) == 0 {
+		return nil, fmt.Errorf("no disks found via by-path")
+	}
+
+	printDebug(fmt.Sprintf("Found %d disks via by-path", len(disks)))
+	return disks, nil
+}
+
+// determineTypeFromPath определяет тип диска по пути by-path
+func determineTypeFromPath(pathLink string) string {
+	filename := filepath.Base(pathLink)
+
+	if strings.Contains(filename, "-nvme-") {
+		return "NVMe"
+	}
+	if strings.Contains(filename, "-usb-") {
+		return "USB"
+	}
+	if strings.Contains(filename, "-ata-") {
+		return "Unknown" // Определим точнее через sysfs
+	}
+
+	return "Unknown"
+}
+
+// determineInterfaceFromPath определяет интерфейс по пути by-path
+func determineInterfaceFromPath(pathLink string) string {
+	filename := filepath.Base(pathLink)
+
+	if strings.Contains(filename, "-nvme-") {
+		return "NVMe"
+	}
+	if strings.Contains(filename, "-usb-") {
+		return "USB"
+	}
+	if strings.Contains(filename, "-ata-") {
+		return "SATA"
+	}
+	if strings.Contains(filename, "-scsi-") {
+		return "SCSI"
+	}
+
+	return "Unknown"
+}
+
+func getDisksFromProcPartitions() ([]DiskInfo, error) {
+	printDebug("Trying /proc/partitions detection method...")
+
+	file, err := os.Open("/proc/partitions")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open /proc/partitions: %v", err)
+	}
+	defer file.Close()
+
+	var disks []DiskInfo
+	scanner := bufio.NewScanner(file)
+
+	// Пропускаем заголовок
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "major") || strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		deviceName := fields[3]
+
+		// Пропускаем разделы и другие не-диски
+		if isPartitionName(deviceName) {
+			continue
+		}
+
+		// Игнорируем loop, ram, dm-* устройства
+		if strings.HasPrefix(deviceName, "loop") ||
+			strings.HasPrefix(deviceName, "ram") ||
+			strings.HasPrefix(deviceName, "dm-") {
+			continue
+		}
+
+		device := "/dev/" + deviceName
+
+		// Проверяем, что устройство действительно существует
+		if _, err := os.Stat(device); os.IsNotExist(err) {
+			continue
+		}
+
+		// Парсим размер в килобайтах
+		sizeKB, err := strconv.Atoi(fields[2])
+		if err != nil {
+			sizeKB = 0
+		}
+		sizeGB := sizeKB / 1024 / 1024
+
+		disk := DiskInfo{
+			Device: device,
+			SizeGB: sizeGB,
+		}
+
+		// Предварительное определение типа по имени устройства
+		disk.Type = determineTypeFromDeviceName(deviceName)
+		disk.Interface = determineInterfaceFromDeviceName(deviceName)
+
+		disk = enrichDiskInfo(disk)
+		disk = determinePhysicalSlot(disk)
+		disk.CleanID = cleanIdentifier(disk.ByIdPath)
+
+		disks = append(disks, disk)
+		printDebug(fmt.Sprintf("Found disk via /proc/partitions: %s (%dGB, Type: %s)", device, sizeGB, disk.Type))
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading /proc/partitions: %v", err)
+	}
+
+	if len(disks) == 0 {
+		return nil, fmt.Errorf("no disks found in /proc/partitions")
+	}
+
+	printDebug(fmt.Sprintf("Found %d disks via /proc/partitions", len(disks)))
+	return disks, nil
+}
+
+// determineTypeFromDeviceName определяет тип диска по имени устройства
+func determineTypeFromDeviceName(deviceName string) string {
+	if strings.HasPrefix(deviceName, "nvme") {
+		return "NVMe"
+	}
+	if strings.HasPrefix(deviceName, "sd") {
+		return "Unknown" // Может быть SATA, USB, SCSI - определим точнее
+	}
+	if strings.HasPrefix(deviceName, "vd") {
+		return "VirtIO"
+	}
+	if strings.HasPrefix(deviceName, "hd") {
+		return "IDE"
+	}
+	if strings.HasPrefix(deviceName, "mmcblk") {
+		return "MMC"
+	}
+	return "Unknown"
+}
+
+// determineInterfaceFromDeviceName определяет интерфейс по имени устройства
+func determineInterfaceFromDeviceName(deviceName string) string {
+	if strings.HasPrefix(deviceName, "nvme") {
+		return "NVMe"
+	}
+	if strings.HasPrefix(deviceName, "sd") {
+		return "SCSI" // Может быть SATA, USB, SCSI - определим точнее через sysfs
+	}
+	if strings.HasPrefix(deviceName, "vd") {
+		return "VirtIO"
+	}
+	if strings.HasPrefix(deviceName, "hd") {
+		return "IDE"
+	}
+	if strings.HasPrefix(deviceName, "mmcblk") {
+		return "MMC"
+	}
+	return "Unknown"
+}
+
+// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ FALLBACK =====
+
+func isPartitionByPathName(name string) bool {
+	// Проверяем, является ли это разделом по имени by-path
+	partitionPatterns := []string{"-part", "_part"}
+	for _, pattern := range partitionPatterns {
+		if strings.Contains(name, pattern) {
+			return true
+		}
+	}
+
+	// Проверяем номер раздела в конце
+	if len(name) > 0 {
+		lastChar := name[len(name)-1]
+		if lastChar >= '1' && lastChar <= '9' {
+			// Проверяем, что перед цифрой есть разделитель
+			if len(name) >= 2 {
+				secondLastChar := name[len(name)-2]
+				if secondLastChar == '-' || secondLastChar == '_' || secondLastChar == 'p' {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func isPartitionName(deviceName string) bool {
+	// Проверяем, является ли имя устройства разделом
+	// sda1, sda2, nvme0n1p1, mmcblk0p1 и т.д.
+
+	// Для sd*, vd*, hd* устройств - цифра в конце означает раздел
+	if regexp.MustCompile(`^[sv]d[a-z]\d+$`).MatchString(deviceName) {
+		return true
+	}
+	if regexp.MustCompile(`^hd[a-z]\d+$`).MatchString(deviceName) {
+		return true
+	}
+
+	// Для nvme устройств - p[цифра] означает раздел
+	if regexp.MustCompile(`^nvme\d+n\d+p\d+$`).MatchString(deviceName) {
+		return true
+	}
+
+	// Для mmcblk устройств - p[цифра] означает раздел
+	if regexp.MustCompile(`^mmcblk\d+p\d+$`).MatchString(deviceName) {
+		return true
+	}
+
+	return false
+}
+
+func isBlockDevice(devicePath string) bool {
+	info, err := os.Stat(devicePath)
+	if err != nil {
+		return false
+	}
+
+	// Проверяем, что это блочное устройство
+	mode := info.Mode()
+	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0
+}
+
 // ===== ОПРЕДЕЛЕНИЕ ФИЗИЧЕСКИХ СЛОТОВ =====
 
 func determinePhysicalSlot(disk DiskInfo) DiskInfo {
 	// Ищем by-path для определения физического слота
-	disk.ByPathPath = findByPathForDevice(disk.Device)
-	disk.ByIdPath = findByIdForDevice(disk.Device)
+	if disk.ByPathPath == "" {
+		disk.ByPathPath = findByPathForDevice(disk.Device)
+	}
+
+	if disk.ByIdPath == "" {
+		disk.ByIdPath = findByIdForDevice(disk.Device)
+	}
 
 	if disk.ByPathPath != "" {
 		disk.PhysicalSlot = extractPhysicalSlotFromPath(disk.ByPathPath)
@@ -438,11 +784,33 @@ func extractPhysicalSlotFromPath(byPathPath string) string {
 		}
 	}
 
-	// Ищем USB порты
+	// Ищем USB порты - улучшенная логика
 	if strings.Contains(filename, "-usb-") {
-		re := regexp.MustCompile(`-usb-[^-]+-[^-]+-(\d+):`)
+		// Пытаемся извлечь номер порта из разных форматов
+		// usb-0:1:1.0 -> порт 1
+		// usb-0:2:1.0 -> порт 2
+		patterns := []string{
+			`-usb-\d+:(\d+):`,   // usb-0:1:1.0
+			`-usb-[^-]+-(\d+):`, // другие форматы
+			`usb(\d+)-`,         // usb1-, usb2-
+		}
+
+		for _, pattern := range patterns {
+			re := regexp.MustCompile(pattern)
+			if matches := re.FindStringSubmatch(filename); len(matches) > 1 {
+				return fmt.Sprintf("USB%s", matches[1])
+			}
+		}
+
+		// Если не смогли извлечь номер, используем USB0
+		return "USB0"
+	}
+
+	// SCSI устройства
+	if strings.Contains(filename, "-scsi-") {
+		re := regexp.MustCompile(`-scsi-(\d+):`)
 		if matches := re.FindStringSubmatch(filename); len(matches) > 1 {
-			return fmt.Sprintf("USB%s", matches[1])
+			return fmt.Sprintf("SCSI%s", matches[1])
 		}
 	}
 
@@ -585,17 +953,24 @@ func checkSlotRequirements(disks []DiskInfo, config *Config) error {
 
 	maxSlot := config.Visualization.TotalSlots
 	if maxSlot == 0 {
-		maxSlot = len(disks) + 2
+		maxSlot = len(disks) + 4 // Достаточно слотов для показа всех возможных
 	}
 
-	// Создаём массив слотов
+	// Создаём массив слотов для всех возможных позиций
 	slots := make([]DiskInfo, maxSlot+1) // +1 because slots start from 1
 
-	// Заполняем слоты дисками
+	// Создаем мапирование физических слотов к логическим из найденных дисков
+	physToLogical := make(map[string]int)
 	for _, disk := range disks {
+		physToLogical[disk.PhysicalSlot] = disk.LogicalSlot
 		if disk.LogicalSlot > 0 && disk.LogicalSlot <= maxSlot {
 			slots[disk.LogicalSlot] = disk
 		}
+	}
+
+	printInfo(fmt.Sprintf("Currently detected %d disks:", len(disks)))
+	for _, disk := range disks {
+		printInfo(fmt.Sprintf("  Slot %d (%s): %s", disk.LogicalSlot, disk.PhysicalSlot, disk.CleanID))
 	}
 
 	// Проверяем каждое требование
@@ -603,7 +978,7 @@ func checkSlotRequirements(disks []DiskInfo, config *Config) error {
 	for _, req := range config.SlotRequirements {
 		printInfo(fmt.Sprintf("Checking requirement: %s", req.Name))
 
-		if !checkSlotRequirement(slots, req, config) {
+		if !checkSlotRequirement(slots, req, config, disks) {
 			allPassed = false
 		}
 	}
@@ -618,7 +993,7 @@ func checkSlotRequirements(disks []DiskInfo, config *Config) error {
 	return nil
 }
 
-func checkSlotRequirement(slots []DiskInfo, req SlotRequirement, config *Config) bool {
+func checkSlotRequirement(slots []DiskInfo, req SlotRequirement, config *Config, _ []DiskInfo) bool {
 	occupiedCount := 0
 	reqPassed := true
 
@@ -642,16 +1017,22 @@ func checkSlotRequirement(slots []DiskInfo, req SlotRequirement, config *Config)
 		reqPassed = false
 	}
 
-	// Проверяем обязательные слоты
+	// Проверяем обязательные слоты - ОСНОВНАЯ ЛОГИКА
+	missingSlots := []int{}
 	for _, slotNum := range req.RequiredSlots {
 		if slotNum > 0 && slotNum < len(slots) {
 			disk := slots[slotNum]
 			if disk.Device == "" {
+				// Слот пустой!
 				if !req.AllowEmpty {
-					printError(fmt.Sprintf("  Required slot %d is empty", slotNum))
+					printError(fmt.Sprintf("  MISSING: Required slot %d is empty", slotNum))
+					missingSlots = append(missingSlots, slotNum)
 					reqPassed = false
+				} else {
+					printWarning(fmt.Sprintf("  Required slot %d is empty (allowed)", slotNum))
 				}
 			} else {
+				// Слот занят - проверяем диск
 				printInfo(fmt.Sprintf("    Slot %d: %s (%s, %dGB)", slotNum, disk.CleanID, disk.Type, disk.SizeGB))
 
 				// Проверяем требования к диску в этом слоте
@@ -668,7 +1049,15 @@ func checkSlotRequirement(slots []DiskInfo, req SlotRequirement, config *Config)
 					}
 				}
 			}
+		} else {
+			printWarning(fmt.Sprintf("  Invalid slot number in requirement: %d", slotNum))
 		}
+	}
+
+	// Показываем детали отсутствующих слотов
+	if len(missingSlots) > 0 {
+		printError(fmt.Sprintf("  Missing %d required slot(s): %v", len(missingSlots), missingSlots))
+		printError("  These slots must contain disks for the system to function properly")
 	}
 
 	// Проверяем опциональные слоты
@@ -687,6 +1076,8 @@ func checkSlotRequirement(slots []DiskInfo, req SlotRequirement, config *Config)
 						printWarning(fmt.Sprintf("      %s", issue))
 					}
 				}
+			} else {
+				printInfo(fmt.Sprintf("    Optional slot %d: empty (allowed)", slotNum))
 			}
 		}
 	}
@@ -769,14 +1160,14 @@ func visualizeSlots(disks []DiskInfo, config *Config) error {
 
 	maxSlots := config.Visualization.TotalSlots
 	if maxSlots == 0 {
-		maxSlots = len(disks) + 2
+		maxSlots = len(disks) + 4
 	}
 
 	// Создаём данные слотов
 	slotData := make([]DiskInfo, maxSlots+1)
 	slotResults := make([]SlotCheckResult, maxSlots+1)
 
-	// Заполняем слоты
+	// Заполняем слоты найденными дисками
 	for _, disk := range disks {
 		if disk.LogicalSlot > 0 && disk.LogicalSlot <= maxSlots {
 			slotData[disk.LogicalSlot] = disk
@@ -784,37 +1175,76 @@ func visualizeSlots(disks []DiskInfo, config *Config) error {
 		}
 	}
 
-	// Проверяем пустые слоты
-	hasErrors := false
-	hasWarnings := false
-
-	for i := 1; i <= maxSlots; i++ {
-		if slotData[i].Device == "" {
-			slotResults[i] = SlotCheckResult{Status: "empty", HasDisk: false}
-		}
-
-		status := slotResults[i].Status
-		if status == "error" {
-			hasErrors = true
-		} else if status == "warning" {
-			hasWarnings = true
+	// Определяем, какие слоты должны быть заняты согласно конфигурации
+	requiredSlots := make(map[int]bool)
+	for _, req := range config.SlotRequirements {
+		for _, slotNum := range req.RequiredSlots {
+			if slotNum > 0 && slotNum <= maxSlots {
+				requiredSlots[slotNum] = true
+			}
 		}
 	}
 
-	// Легенда
+	// Проверяем пустые слоты и помечаем отсутствующие как ошибки
+	hasErrors := false
+	hasWarnings := false
+	missingDisks := []int{}
+
+	for i := 1; i <= maxSlots; i++ {
+		if slotData[i].Device == "" {
+			// Пустой слот
+			if requiredSlots[i] {
+				// Этот слот должен быть занят!
+				slotResults[i] = SlotCheckResult{
+					Status:  "error",
+					HasDisk: false,
+					Issues:  []string{"Required disk missing"},
+				}
+				missingDisks = append(missingDisks, i)
+				hasErrors = true
+			} else {
+				// Пустой необязательный слот
+				slotResults[i] = SlotCheckResult{
+					Status:  "empty",
+					HasDisk: false,
+				}
+			}
+		} else {
+			// Занятый слот - проверяем статус диска
+			status := slotResults[i].Status
+			if status == "error" {
+				hasErrors = true
+			} else if status == "warning" {
+				hasWarnings = true
+			}
+		}
+	}
+
+	// Легенда с информацией об ошибках
 	printInfo("Legend:")
 	fmt.Printf("  %s%s%s Disk Present & OK  ", ColorGreen, "████", ColorReset)
 	fmt.Printf("  %s%s%s Disk with Issues  ", ColorYellow, "████", ColorReset)
-	fmt.Printf("  %s%s%s Empty Slot\n", ColorWhite, "░░░░", ColorReset)
+	fmt.Printf("  %s%s%s MISSING Required Disk  ", ColorRed, "░░░░", ColorReset)
+	fmt.Printf("  %s%s%s Empty Optional Slot\n", ColorWhite, "░░░░", ColorReset)
 	fmt.Println()
+
+	// Сообщаем об отсутствующих дисках
+	if len(missingDisks) > 0 {
+		printError(fmt.Sprintf("CRITICAL: %d required disk(s) missing!", len(missingDisks)))
+		for _, slotNum := range missingDisks {
+			printError(fmt.Sprintf("  - Slot %d: Required disk not found", slotNum))
+		}
+		fmt.Println()
+	}
 
 	// Рендерим визуализацию
 	renderSlotVisualization(slotData, slotResults, config, maxSlots)
 
 	// Финальный статус
 	if hasErrors {
-		printError("Slot configuration validation FAILED!")
-		return fmt.Errorf("slot configuration validation failed")
+		printError("CRITICAL: Slot configuration validation FAILED!")
+		printError("Some required disks are missing from their expected slots")
+		return fmt.Errorf("critical: missing required disks in slots %v", missingDisks)
 	} else if hasWarnings {
 		printWarning("Slot configuration validation completed with warnings")
 		return nil
@@ -895,8 +1325,10 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 			case "warning":
 				fmt.Print(ColorYellow + symbolText + ColorReset)
 			case "error":
-				fmt.Print(ColorRed + symbolText + ColorReset)
+				// Красный цвет для отсутствующих обязательных дисков
+				fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
 			case "empty":
+				// Серый цвет для пустых необязательных слотов
 				fmt.Print(centerText("░░░░", width))
 			default:
 				fmt.Print(symbolText)
@@ -926,7 +1358,13 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 					fmt.Print(nameText)
 				}
 			} else {
-				fmt.Print(strings.Repeat(" ", width))
+				// Для пустых слотов показываем статус
+				switch result.Status {
+				case "error":
+					fmt.Print(ColorRed + centerText("MISS", width) + ColorReset)
+				default:
+					fmt.Print(strings.Repeat(" ", width))
+				}
 			}
 			fmt.Print("│")
 		}
@@ -952,7 +1390,13 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 					fmt.Print(sizeText)
 				}
 			} else {
-				fmt.Print(strings.Repeat(" ", width))
+				// Для пустых слотов
+				switch result.Status {
+				case "error":
+					fmt.Print(ColorRed + centerText("REQ", width) + ColorReset)
+				default:
+					fmt.Print(strings.Repeat(" ", width))
+				}
 			}
 			fmt.Print("│")
 		}
@@ -979,7 +1423,13 @@ func renderSlotVisualization(slotData []DiskInfo, slotResults []SlotCheckResult,
 						fmt.Print(tempText)
 					}
 				} else {
-					fmt.Print(strings.Repeat(" ", width))
+					// Для пустых слотов
+					switch result.Status {
+					case "error":
+						fmt.Print(ColorRed + centerText("ERR", width) + ColorReset)
+					default:
+						fmt.Print(strings.Repeat(" ", width))
+					}
 				}
 				fmt.Print("│")
 			}
@@ -1055,6 +1505,10 @@ func createDefaultConfig(configPath string) error {
 
 	printInfo(fmt.Sprintf("Found %d disk(s) in physical slots:", len(disks)))
 
+	// Создаем фиксированное мапирование физических слотов на логические
+	slotMapping := make(map[string]int)
+	expectedSlots := make(map[int]bool) // Какие слоты должны быть заняты
+
 	// Группируем диски по типам
 	typeGroups := make(map[string][]DiskInfo)
 	for _, disk := range disks {
@@ -1064,10 +1518,12 @@ func createDefaultConfig(configPath string) error {
 	var requirements []SlotRequirement
 	typeVisuals := make(map[string]DiskVisual)
 
-	// Показываем найденные диски
+	// Показываем найденные диски и создаем мапирование
 	for _, disk := range disks {
-		printInfo(fmt.Sprintf("  Slot %d: %s (%s, %dGB, %s)",
-			disk.LogicalSlot, disk.CleanID, disk.Type, disk.SizeGB, disk.PhysicalSlot))
+		slotMapping[disk.PhysicalSlot] = disk.LogicalSlot
+		expectedSlots[disk.LogicalSlot] = true
+		printInfo(fmt.Sprintf("  Slot %d (%s): %s (%s, %dGB)",
+			disk.LogicalSlot, disk.PhysicalSlot, disk.CleanID, disk.Type, disk.SizeGB))
 	}
 
 	// Проверяем SMART
@@ -1079,7 +1535,7 @@ func createDefaultConfig(configPath string) error {
 		}
 	}
 
-	// Создаём требования по типам
+	// Создаём требования по типам с конкретными слотами
 	for diskType, disksOfType := range typeGroups {
 		printInfo(fmt.Sprintf("  Processing %d %s disk(s):", len(disksOfType), diskType))
 
@@ -1096,14 +1552,14 @@ func createDefaultConfig(configPath string) error {
 		}
 
 		req := SlotRequirement{
-			Name:          fmt.Sprintf("%s slots (%d occupied)", diskType, len(disksOfType)),
+			Name:          fmt.Sprintf("%s slots (%d required)", diskType, len(disksOfType)),
 			MinOccupied:   len(disksOfType),
 			RequiredType:  diskType,
 			MinSizeGB:     minSize,
-			RequireHealth: globalHasHealth,
+			RequireHealth: globalHasHealth && shouldCheckSMART(disksOfType[0]),
 			MaxTempC:      70,
-			RequiredSlots: requiredSlots,
-			AllowEmpty:    false,
+			RequiredSlots: requiredSlots, // Конкретные слоты, которые должны быть заняты
+			AllowEmpty:    false,         // Не разрешаем пустые обязательные слоты
 		}
 
 		requirements = append(requirements, req)
@@ -1113,11 +1569,26 @@ func createDefaultConfig(configPath string) error {
 		typeVisuals[diskType] = visual
 	}
 
+	// Создаем дополнительное требование для общей проверки слотов
+	allRequiredSlots := make([]int, 0, len(expectedSlots))
+	for slot := range expectedSlots {
+		allRequiredSlots = append(allRequiredSlots, slot)
+	}
+
+	generalReq := SlotRequirement{
+		Name:          fmt.Sprintf("All expected slots (%d total)", len(allRequiredSlots)),
+		MinOccupied:   len(allRequiredSlots),
+		RequiredType:  "any", // Любой тип подходит
+		RequiredSlots: allRequiredSlots,
+		AllowEmpty:    false,
+	}
+	requirements = append(requirements, generalReq)
+
 	config := Config{
 		SlotRequirements: requirements,
 		Visualization: VisualizationConfig{
 			TypeVisuals: typeVisuals,
-			TotalSlots:  len(disks) + 2,
+			TotalSlots:  len(disks) + 4, // Больше слотов для показа потенциально пустых
 			SlotWidth:   12,
 			SlotsPerRow: 6,
 			ShowTemp:    true,
@@ -1143,17 +1614,22 @@ func createDefaultConfig(configPath string) error {
 		return err
 	}
 
-	printSuccess("Configuration created successfully based on physical slots")
+	printSuccess("Configuration created successfully with fixed slot mapping")
 	printInfo(fmt.Sprintf("Total slots configured: %d", len(disks)))
-	printInfo("Configuration focuses on slot occupancy rather than specific devices")
+	printInfo("Configuration will detect missing disks in required slots")
 	if globalHasHealth {
 		printInfo("SMART checking enabled")
+	}
+
+	// Сохраняем информацию о физическом мапировании для отладки
+	printInfo("Physical slot mapping:")
+	for physSlot, logSlot := range slotMapping {
+		printInfo(fmt.Sprintf("  %s -> Logical slot %d", physSlot, logSlot))
 	}
 
 	return nil
 }
 
-// Остальные функции без изменений...
 func isPartitionByIdName(name string) bool {
 	partitionPatterns := []string{"-part", "_part"}
 	for _, pattern := range partitionPatterns {
@@ -1177,14 +1653,6 @@ func isPartitionByIdName(name string) bool {
 	return false
 }
 
-func getDisksFromByPath() ([]DiskInfo, error) {
-	return nil, fmt.Errorf("by-path fallback not implemented")
-}
-
-func getDisksFromProcPartitions() ([]DiskInfo, error) {
-	return nil, fmt.Errorf("proc partitions fallback not implemented")
-}
-
 func enrichDiskInfo(disk DiskInfo) DiskInfo {
 	// Получаем размер если не определён
 	if disk.SizeGB == 0 {
@@ -1197,26 +1665,55 @@ func enrichDiskInfo(disk DiskInfo) DiskInfo {
 	// Получаем точки монтирования
 	disk.MountPoints = getMountPoints(disk.Device)
 
-	// SMART данные
-	if smart, err := getSmartInfo(disk.Device); err == nil {
-		disk.SmartStatus = smart.Status
-		disk.Temperature = smart.Temperature
-		disk.PowerOnHrs = smart.PowerOnHours
-		disk.PowerCycles = smart.PowerCycles
-		if disk.Firmware == "" {
-			disk.Firmware = smart.Firmware
-		}
-		if disk.RotSpeed == 0 {
-			disk.RotSpeed = smart.RotationRate
+	// SMART данные - пропускаем для USB и других removable устройств
+	if shouldCheckSMART(disk) {
+		if smart, err := getSmartInfo(disk.Device); err == nil {
+			disk.SmartStatus = smart.Status
+			disk.Temperature = smart.Temperature
+			disk.PowerOnHrs = smart.PowerOnHours
+			disk.PowerCycles = smart.PowerCycles
+			if disk.Firmware == "" {
+				disk.Firmware = smart.Firmware
+			}
+			if disk.RotSpeed == 0 {
+				disk.RotSpeed = smart.RotationRate
+			}
+		} else {
+			disk.SmartStatus = "N/A"
+			if debugMode {
+				printDebug(fmt.Sprintf("SMART data unavailable for %s: %v", disk.Device, err))
+			}
 		}
 	} else {
 		disk.SmartStatus = "N/A"
 		if debugMode {
-			printDebug(fmt.Sprintf("SMART data unavailable for %s: %v", disk.Device, err))
+			printDebug(fmt.Sprintf("Skipping SMART for %s (Type: %s, Removable: %t)",
+				disk.Device, disk.Type, disk.IsRemovable))
 		}
 	}
 
 	return disk
+}
+
+// shouldCheckSMART определяет, нужно ли проверять SMART для данного диска
+func shouldCheckSMART(disk DiskInfo) bool {
+	// Пропускаем SMART для USB устройств
+	if disk.Type == "USB" || disk.IsRemovable {
+		return false
+	}
+
+	// Пропускаем для виртуальных устройств
+	if disk.Type == "VirtIO" || strings.Contains(disk.Device, "vd") {
+		return false
+	}
+
+	// Пропускаем для MMC/SD карт
+	if strings.Contains(disk.Device, "mmcblk") {
+		return false
+	}
+
+	// Проверяем SMART для SATA, NVMe, SSD, HDD
+	return disk.Type == "SATA" || disk.Type == "NVMe" || disk.Type == "SSD" || disk.Type == "HDD"
 }
 
 func getDiskSizeFromDevice(device string) int {
@@ -1244,24 +1741,25 @@ func enrichFromSysBlock(disk DiskInfo) DiskInfo {
 	sysPath := fmt.Sprintf("/sys/block/%s", deviceName)
 
 	if _, err := os.Stat(sysPath); os.IsNotExist(err) {
-		disk.Type = "Unknown"
+		if disk.Type == "" {
+			disk.Type = "Unknown"
+		}
 		return disk
 	}
 
-	if model, err := readSysFile(sysPath + "/device/model"); err == nil {
+	if model, err := readSysFile(sysPath + "/device/model"); err == nil && disk.Model == "" {
 		disk.Model = strings.TrimSpace(model)
 	}
 
-	if vendor, err := readSysFile(sysPath + "/device/vendor"); err == nil {
+	if vendor, err := readSysFile(sysPath + "/device/vendor"); err == nil && disk.Vendor == "" {
 		disk.Vendor = strings.TrimSpace(vendor)
 	}
 
-	if serial, err := readSysFile(sysPath + "/device/serial"); err == nil {
-		if disk.Serial == "" {
-			disk.Serial = strings.TrimSpace(serial)
-		}
+	if serial, err := readSysFile(sysPath + "/device/serial"); err == nil && disk.Serial == "" {
+		disk.Serial = strings.TrimSpace(serial)
 	}
 
+	// Определяем тип и интерфейс только если они еще не определены
 	if disk.Type == "" || disk.Type == "Unknown" {
 		disk.Type = determineDiskTypeFromSys(deviceName, sysPath)
 	}
@@ -1270,18 +1768,34 @@ func enrichFromSysBlock(disk DiskInfo) DiskInfo {
 		disk.Interface = determineInterface(deviceName, sysPath)
 	}
 
-	if removable, err := readSysFile(sysPath + "/removable"); err == nil {
-		disk.IsRemovable = strings.TrimSpace(removable) == "1"
+	// Проверяем removable только если еще не определено
+	if !disk.IsRemovable {
+		if removable, err := readSysFile(sysPath + "/removable"); err == nil {
+			disk.IsRemovable = strings.TrimSpace(removable) == "1"
+			// Если removable и тип не определен, это скорее всего USB
+			if disk.IsRemovable && (disk.Type == "" || disk.Type == "Unknown") {
+				disk.Type = "USB"
+				disk.Interface = "USB"
+			}
+		}
 	}
 
-	if rotational, err := readSysFile(sysPath + "/queue/rotational"); err == nil {
-		if strings.TrimSpace(rotational) == "1" {
-			if rate, err := readSysFile(sysPath + "/device/rotation_rate"); err == nil {
-				if rpm, parseErr := strconv.Atoi(strings.TrimSpace(rate)); parseErr == nil {
-					disk.RotSpeed = rpm
+	// Получаем rotation speed только для HDD
+	if disk.Type == "HDD" {
+		if rotational, err := readSysFile(sysPath + "/queue/rotational"); err == nil {
+			if strings.TrimSpace(rotational) == "1" {
+				if rate, err := readSysFile(sysPath + "/device/rotation_rate"); err == nil {
+					if rpm, parseErr := strconv.Atoi(strings.TrimSpace(rate)); parseErr == nil && rpm > 0 {
+						disk.RotSpeed = rpm
+					}
 				}
 			}
 		}
+	}
+
+	if debugMode {
+		printDebug(fmt.Sprintf("Enriched from sysfs %s: Type=%s, Interface=%s, Removable=%t",
+			deviceName, disk.Type, disk.Interface, disk.IsRemovable))
 	}
 
 	return disk
@@ -1296,21 +1810,31 @@ func readSysFile(path string) (string, error) {
 }
 
 func determineDiskTypeFromSys(deviceName, sysPath string) string {
+	// Проверяем NVMe по имени устройства
 	if strings.Contains(deviceName, "nvme") {
 		return "NVMe"
 	}
 
+	// Проверяем USB устройства
+	if devicePath, err := os.Readlink(sysPath + "/device"); err == nil {
+		if strings.Contains(devicePath, "usb") {
+			return "USB"
+		}
+	}
+
+	// Проверяем removable устройства
+	if removable, err := readSysFile(sysPath + "/removable"); err == nil {
+		if strings.TrimSpace(removable) == "1" {
+			return "USB"
+		}
+	}
+
+	// Проверяем rotation только для не-USB устройств
 	if rotational, err := readSysFile(sysPath + "/queue/rotational"); err == nil {
 		if strings.TrimSpace(rotational) == "0" {
 			return "SSD"
 		} else {
 			return "HDD"
-		}
-	}
-
-	if removable, err := readSysFile(sysPath + "/removable"); err == nil {
-		if strings.TrimSpace(removable) == "1" {
-			return "USB"
 		}
 	}
 
@@ -1322,6 +1846,7 @@ func determineInterface(deviceName, sysPath string) string {
 		return "NVMe"
 	}
 
+	// Проверяем путь к устройству в sysfs
 	if devicePath, err := os.Readlink(sysPath + "/device"); err == nil {
 		if strings.Contains(devicePath, "usb") {
 			return "USB"
@@ -1329,13 +1854,32 @@ func determineInterface(deviceName, sysPath string) string {
 		if strings.Contains(devicePath, "ata") {
 			return "SATA"
 		}
+		if strings.Contains(devicePath, "nvme") {
+			return "NVMe"
+		}
 		if strings.Contains(devicePath, "scsi") {
 			return "SCSI"
 		}
+		if strings.Contains(devicePath, "virtio") {
+			return "VirtIO"
+		}
 	}
 
+	// Fallback по префиксу имени устройства
 	if strings.HasPrefix(deviceName, "sd") {
-		return "SATA"
+		return "SATA" // Чаще всего это SATA
+	}
+	if strings.HasPrefix(deviceName, "nvme") {
+		return "NVMe"
+	}
+	if strings.HasPrefix(deviceName, "vd") {
+		return "VirtIO"
+	}
+	if strings.HasPrefix(deviceName, "hd") {
+		return "IDE"
+	}
+	if strings.HasPrefix(deviceName, "mmcblk") {
+		return "MMC"
 	}
 
 	return "Unknown"
