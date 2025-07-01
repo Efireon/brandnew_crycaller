@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -20,7 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const VERSION = "2.0.3"
+const VERSION = "2.1.2"
 
 // ANSI color codes
 const (
@@ -476,6 +477,10 @@ func printInfo(message string) {
 	printColored(ColorBlue, message)
 }
 
+func printDebug(message string) {
+	printColored(ColorWhite, message)
+}
+
 func printSuccess(message string) {
 	printColored(ColorGreen, message)
 }
@@ -511,6 +516,24 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func runCommand(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return strings.TrimSpace(out.String()), err
+}
+
+func runCommandNoOutput(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	// Do not show full output, keep only debug messages
+	var dummy bytes.Buffer
+	cmd.Stdout = &dummy
+	cmd.Stderr = &dummy
+	return cmd.Run()
 }
 
 func askUserAction(testName string) string {
@@ -2446,6 +2469,392 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 	return nil
 }
 
+func findBootDevice() (string, error) {
+	output, err := runCommand("findmnt", "/", "-o", "SOURCE", "-n")
+	if err != nil {
+		return "", fmt.Errorf("findmnt failed: %v", err)
+	}
+	output = strings.TrimSpace(output)
+	loopRegex := regexp.MustCompile(`^/dev/loop[0-9]+$`)
+	if output == "airootfs" || loopRegex.MatchString(output) {
+		// If running from ArchISO, check if /run/archiso/bootmnt is mounted
+		bootMntSource, err := runCommand("findmnt", "/run/archiso/bootmnt", "-o", "SOURCE", "-n")
+		if err == nil && bootMntSource != "" {
+			bootMntSource = strings.TrimSpace(bootMntSource)
+			printDebug(fmt.Sprintf("Found archiso boot mount: %s", bootMntSource))
+
+			// Extract the disk device from the partition (e.g. /dev/sda1 -> /dev/sda)
+			if strings.Contains(bootMntSource, "nvme") {
+				// For NVMe devices: /dev/nvme0n1p1 -> /dev/nvme0n1
+				devRegex := regexp.MustCompile(`p[0-9]+$`)
+				return devRegex.ReplaceAllString(bootMntSource, ""), nil
+			} else {
+				// For other devices: /dev/sda1 -> /dev/sda
+				devRegex := regexp.MustCompile(`[0-9]+$`)
+				return devRegex.ReplaceAllString(bootMntSource, ""), nil
+			}
+		}
+		return "LOOP", nil
+	}
+	// For NVMe devices, name looks like "/dev/nvme0n1p1" - parent disk: "/dev/nvme0n1"
+	if strings.Contains(output, "nvme") {
+		devRegex := regexp.MustCompile(`p[0-9]+$`)
+		return devRegex.ReplaceAllString(output, ""), nil
+	}
+	// For other devices, e.g. "/dev/sda2" - parent disk: "/dev/sda"
+	devRegex := regexp.MustCompile(`[0-9]+$`)
+	return devRegex.ReplaceAllString(output, ""), nil
+}
+
+func listRealDisks() ([]string, error) {
+	output, err := runCommand("lsblk", "-d", "-o", "NAME,TYPE", "-rn")
+	if err != nil {
+		return nil, fmt.Errorf("lsblk failed: %v", err)
+	}
+	var disks []string
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == "disk" {
+			disks = append(disks, "/dev/"+fields[0])
+		}
+	}
+	return disks, nil
+}
+
+func isEfiPartition(part string) bool {
+	output, err := runCommand("blkid", "-o", "export", part)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if matched, _ := regexp.MatchString(`^TYPE=(fat|vfat|msdos)`, line); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// Improved function to find external EFI partition with prioritization for the boot device
+func findExternalEfiPartition(bootDev string) (string, string, error) {
+	disks, err := listRealDisks()
+	if err != nil {
+		return "", "", err
+	}
+
+	printDebug(fmt.Sprintf("All disks: %v", disks))
+	printDebug(fmt.Sprintf("Boot device: %s", bootDev))
+
+	// Check if we're running from ArchISO/live environment
+
+	// Check what device /run/archiso/bootmnt is mounted on (if we're in a live environment)
+	var archisoDev string
+	if bootMntSource, err := runCommand("findmnt", "/run/archiso/bootmnt", "-o", "SOURCE", "-n"); err == nil && bootMntSource != "" {
+		bootMntSource = strings.TrimSpace(bootMntSource)
+		printDebug(fmt.Sprintf("Found archiso boot mount: %s", bootMntSource))
+
+		// Extract the disk device from the partition (e.g. /dev/sda1 -> /dev/sda)
+		if strings.Contains(bootMntSource, "nvme") {
+			// For NVMe devices: /dev/nvme0n1p1 -> /dev/nvme0n1
+			devRegex := regexp.MustCompile(`p[0-9]+$`)
+			archisoDev = devRegex.ReplaceAllString(bootMntSource, "")
+		} else {
+			// For other devices: /dev/sda1 -> /dev/sda
+			devRegex := regexp.MustCompile(`[0-9]+$`)
+			archisoDev = devRegex.ReplaceAllString(bootMntSource, "")
+		}
+		printDebug(fmt.Sprintf("Extracted archiso device: %s", archisoDev))
+	}
+
+	// First check for EFI partitions on the boot device itself (if we're booting from ArchISO)
+	var bootDevEfiPartitions []struct {
+		disk      string
+		partition string
+	}
+
+	var otherEfiPartitions []struct {
+		disk      string
+		partition string
+	}
+
+	// First pass - collect all EFI partitions and separate them into boot device partitions and others
+	for _, dev := range disks {
+		// Determine if this disk is our boot device
+		isBootDevice := dev == bootDev || dev == archisoDev
+
+		printDebug(fmt.Sprintf("Checking disk: %s for partitions (boot device: %v)", dev, isBootDevice))
+
+		// Get all partitions for this disk
+		output, err := runCommand("lsblk", "-nlo", "NAME", dev)
+		if err != nil {
+			printDebug(fmt.Sprintf("Error listing partitions for %s: %v", dev, err))
+			continue
+		}
+
+		partitions := strings.Split(output, "\n")
+		for _, part := range partitions {
+			part = strings.TrimSpace(part)
+
+			// Skip the disk itself from lsblk output
+			if part == filepath.Base(dev) {
+				continue
+			}
+
+			// Construct full path to partition
+			partPath := "/dev/" + part
+			printDebug(fmt.Sprintf("Checking partition: %s", partPath))
+
+			// Skip if it's the same as disk device
+			if partPath == dev {
+				printDebug(fmt.Sprintf("Skipping partition %s as it's the same as disk device", partPath))
+				continue
+			}
+
+			if isEfiPartition(partPath) {
+				printDebug(fmt.Sprintf("Found EFI partition: %s on disk: %s", partPath, dev))
+
+				// Add to appropriate list based on whether it's on the boot device
+				if isBootDevice {
+					bootDevEfiPartitions = append(bootDevEfiPartitions, struct {
+						disk      string
+						partition string
+					}{dev, partPath})
+				} else {
+					otherEfiPartitions = append(otherEfiPartitions, struct {
+						disk      string
+						partition string
+					}{dev, partPath})
+				}
+			}
+		}
+	}
+
+	// First try EFI partitions on the boot device (if any)
+	if len(bootDevEfiPartitions) > 0 {
+		if len(bootDevEfiPartitions) > 1 {
+			printDebug(fmt.Sprintf("Multiple EFI partitions found on boot device. Using the first one."))
+			for i, part := range bootDevEfiPartitions {
+				printDebug(fmt.Sprintf("Boot device EFI partition %d: disk=%s, partition=%s", i+1, part.disk, part.partition))
+			}
+		}
+		printDebug(fmt.Sprintf("Selected EFI partition on boot device: %s", bootDevEfiPartitions[0].partition))
+		return bootDevEfiPartitions[0].disk, bootDevEfiPartitions[0].partition, nil
+	}
+
+	// If no EFI partitions found on boot device, fall back to other disks
+	if len(otherEfiPartitions) > 0 {
+		if len(otherEfiPartitions) > 1 {
+			printDebug(fmt.Sprintf("Multiple EFI partitions found on other devices. Using the first one."))
+			for i, part := range otherEfiPartitions {
+				printDebug(fmt.Sprintf("Other device EFI partition %d: disk=%s, partition=%s", i+1, part.disk, part.partition))
+			}
+		}
+		printDebug(fmt.Sprintf("Selected EFI partition on non-boot device: %s", otherEfiPartitions[0].partition))
+		return otherEfiPartitions[0].disk, otherEfiPartitions[0].partition, nil
+	}
+
+	// If we get here, no EFI partition was found
+	return "", "", errors.New("no EFI partition found on any disk")
+}
+
+// bootctl mounts external EFI partition, copies contents of efishell directory (ctefi)
+// and sets one-time boot entry (via setOneTimeBoot). Do not change this function!
+func bootctl() error {
+	// Determine boot device
+	bootDev, err := findBootDevice()
+	if err != nil {
+		return fmt.Errorf("Could not determine boot device: %v", err)
+	}
+
+	printDebug(fmt.Sprintf("Detected boot device: %s", bootDev))
+
+	// Find external EFI partition
+	targetDevice, targetEfi, err := findExternalEfiPartition(bootDev)
+	if err != nil || targetDevice == "" || targetEfi == "" {
+		return errors.New("No external EFI partition found")
+	}
+
+	// Additional check to ensure targetEfi is a partition, not the whole disk
+	if targetEfi == targetDevice {
+		return fmt.Errorf("targetEfi cannot be the same as targetDevice: %s", targetEfi)
+	}
+
+	printDebug("targetDevice: " + targetDevice)
+	printDebug("targetEFI: " + targetEfi)
+
+	// No need to mount and copy files, as all necessary information is in EFI variables
+	printDebug("Using EFI variables instead of copying files to EFI partition")
+
+	// Call setOneTimeBoot function to create new entry and set BootNext
+	if err := setOneTimeBoot(targetDevice, targetEfi); err != nil {
+		return fmt.Errorf("setOneTimeBoot error: %v", err)
+	}
+
+	if err = runCommandNoOutput("bootctl", "set-oneshot", "03-efishell.conf"); err != nil {
+		printError("Failed to set one-time boot entry: " + err.Error())
+		os.Exit(1)
+	} else {
+		printDebug("One-time boot entry set successfully.")
+	}
+
+	return nil
+}
+
+// setOneTimeBoot creates a new one-time boot entry and sets BootNext
+func setOneTimeBoot(targetDevice, targetEfi string) error {
+	printDebug(fmt.Sprintf("setOneTimeBoot: targetDevice=%s, targetEfi=%s", targetDevice, targetEfi))
+
+	// Use the regular expression that should not be changed - DO NOT TOUCH!
+	re := regexp.MustCompile(`(?im)^Boot([0-9A-Fa-f]{4})(\*?)\s+OneTimeBoot\t(.+)$`)
+
+	// Check if there are conflicting entries
+	out, err := runCommand("efibootmgr")
+	if err != nil {
+		return fmt.Errorf("efibootmgr failed: %v", err)
+	}
+
+	// Find only entries that conflict (have the same boot path)
+	matches := re.FindAllStringSubmatch(out, -1)
+
+	// Define the boot path for our new entry
+	targetBootPath := "\\EFI\\BOOT\\shellx64.efi -delay:0"
+
+	// Determine partition number for the new device
+	var partition string
+
+	// Extract the partition number from targetEfi path
+	if strings.Contains(targetDevice, "nvme") {
+		// For NVMe devices, name looks like "/dev/nvme0n1p1" - parent disk: "/dev/nvme0n1"
+		// Verify that targetEfi has format like /dev/nvme0n1p1
+		nvmePartRegex := regexp.MustCompile(`^(/dev/nvme[0-9]+n[0-9]+)p([0-9]+)$`)
+		matches := nvmePartRegex.FindStringSubmatch(targetEfi)
+		if len(matches) == 3 {
+			printDebug(fmt.Sprintf("NVMe partition identified: disk=%s, partition=%s", matches[1], matches[2]))
+			// Check if targetDevice matches the disk part
+			if matches[1] != targetDevice {
+				printDebug(fmt.Sprintf("Warning: Extracted disk %s doesn't match targetDevice %s", matches[1], targetDevice))
+				// Use the matched disk as targetDevice for consistency
+				targetDevice = matches[1]
+			}
+			partition = matches[2]
+		} else {
+			return fmt.Errorf("invalid NVMe partition format: %s", targetEfi)
+		}
+	} else {
+		// For other devices, e.g. "/dev/sda1" - parent disk: "/dev/sda"
+		stdPartRegex := regexp.MustCompile(`^(/dev/[a-z]+)([0-9]+)$`)
+		matches := stdPartRegex.FindStringSubmatch(targetEfi)
+		if len(matches) == 3 {
+			printDebug(fmt.Sprintf("Standard partition identified: disk=%s, partition=%s", matches[1], matches[2]))
+			// Check if targetDevice matches the disk part
+			if matches[1] != targetDevice {
+				printDebug(fmt.Sprintf("Warning: Extracted disk %s doesn't match targetDevice %s", matches[1], targetDevice))
+				// Use the matched disk as targetDevice for consistency
+				targetDevice = matches[1]
+			}
+			partition = matches[2]
+		} else {
+			return fmt.Errorf("invalid partition format: %s", targetEfi)
+		}
+	}
+
+	if partition == "" {
+		return fmt.Errorf("could not determine partition number from targetEfi: %s", targetEfi)
+	}
+
+	printDebug(fmt.Sprintf("Using disk device: %s, partition: %s", targetDevice, partition))
+
+	// Remove only entries that conflict with our target entry
+	for _, match := range matches {
+		bootNum := match[1]
+
+		// Get more detailed info about the entry
+		bootInfo, err := runCommand("efibootmgr", "-v", "-b", bootNum)
+		if err != nil {
+			printDebug(fmt.Sprintf("[WARNING] Failed to get info for Boot%s: %v", bootNum, err))
+			continue
+		}
+
+		// Check if the entry contains the same boot path
+		if strings.Contains(bootInfo, targetBootPath) {
+			printDebug("[INFO] Removing conflicting OneTimeBoot entry: Boot" + bootNum)
+			if err := runCommandNoOutput("efibootmgr", "-B", "-b", bootNum); err != nil {
+				printDebug(fmt.Sprintf("[WARNING] Failed to remove Boot%s: %v", bootNum, err))
+			}
+		} else {
+			printDebug("[INFO] Keeping non-conflicting OneTimeBoot entry: Boot" + bootNum)
+		}
+	}
+
+	printDebug("targetDevice: " + targetDevice)
+	printDebug("Partition: " + partition)
+
+	printDebug("[INFO] Creating new OneTimeBoot entry")
+	// Create a new entry without displaying command result
+	createCmd := exec.Command("efibootmgr",
+		"-c",
+		"-d", targetDevice,
+		"-p", partition,
+		"-L", "OneTimeBoot",
+		"-l", targetBootPath)
+	// Hide efibootmgr output, keep only debug messages
+	var createOut bytes.Buffer
+	createCmd.Stdout = &createOut
+	createCmd.Stderr = &createOut
+	if err := createCmd.Run(); err != nil {
+		printDebug("[ERROR] efibootmgr create output: " + createOut.String())
+		return fmt.Errorf("failed to create new boot entry: %v", err)
+	}
+
+	// Find the created entry with OneTimeBoot label
+	out, err = runCommand("efibootmgr", "-v")
+	if err != nil {
+		return fmt.Errorf("efibootmgr failed after creation: %v", err)
+	}
+	matches = re.FindAllStringSubmatch(out, -1)
+	if len(matches) == 0 {
+		return errors.New("new OneTimeBoot entry not found after creation")
+	}
+
+	// Find our new entry - it should be the last created with this label
+	var bootNum string
+	for _, match := range matches {
+		candidateBootNum := match[1]
+		bootInfo, err := runCommand("efibootmgr", "-v", "-b", candidateBootNum)
+		if err == nil && strings.Contains(bootInfo, targetBootPath) &&
+			strings.Contains(bootInfo, targetDevice) {
+			bootNum = candidateBootNum
+			break
+		}
+	}
+
+	if bootNum == "" {
+		// If we didn't find an exact match, use the last entry
+		bootNum = matches[len(matches)-1][1]
+	}
+
+	printDebug("[INFO] New OneTimeBoot entry created: Boot" + bootNum)
+
+	// Set BootNext to the created entry
+	if err := runCommandNoOutput("efibootmgr", "-n", bootNum); err != nil {
+		out2, err2 := runCommand("efibootmgr", "-v")
+		if err2 == nil && strings.Contains(out2, "BootNext: "+bootNum) {
+			printDebug("BootNext is already set to Boot" + bootNum)
+			return nil
+		}
+		return fmt.Errorf("failed to set BootNext to %s: %v", bootNum, err)
+	}
+
+	out3, err3 := runCommand("efibootmgr", "-v")
+	if err3 == nil && strings.Contains(out3, "BootNext: "+bootNum) {
+		printDebug("BootNext is set to Boot" + bootNum)
+		return nil
+	}
+
+	return fmt.Errorf("failed to verify BootNext setting for Boot%s", bootNum)
+}
+
 func main() {
 	var configPath string
 	var showVersion bool
@@ -2679,5 +3088,32 @@ func main() {
 		fmt.Printf("\n%sExiting with error code %d due to failed critical operations%s\n",
 			ColorRed, exitCode, ColorReset)
 	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("\n%sDo you want to reboot the system now?%s %s[Y/n]%s: ", ColorWhite, ColorReset, ColorGreen, ColorReset)
+
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		input = "Y"
+	}
+	input = strings.TrimSpace(strings.ToUpper(input))
+
+	if input == "" || input == "Y" || input == "YES" {
+		printInfo("Preparing system for reboot...")
+
+		if err := bootctl(); err != nil {
+			printError("Bootctl error: " + err.Error())
+			os.Exit(1)
+		}
+
+		printSuccess("System will reboot now...")
+		if err := exec.Command("reboot").Run(); err != nil {
+			printError(fmt.Sprintf("Failed to reboot: %v", err))
+			os.Exit(1)
+		}
+	} else {
+		printInfo("Reboot cancelled by user.")
+	}
+
 	os.Exit(exitCode)
 }
