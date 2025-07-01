@@ -15,7 +15,7 @@ import (
 const VERSION = "1.0.1"
 
 type DiskInfo struct {
-	Slot        string `json:"slot"`        // Physical slot (HCTL: "1:0:0:0" or PCI: "0000:06:00.0")
+	Slot        string `json:"slot"`        // Physical slot (HCTL: "1:0:0:0" or PCI: "0000:06:00.0" or USB: "1-2:1.0")
 	SlotType    string `json:"slot_type"`   // "SATA", "NVMe", "USB"
 	Device      string `json:"device"`      // /dev/sda, /dev/nvme0n1, etc.
 	IsPresent   bool   `json:"is_present"`  // Whether device is present in slot
@@ -25,18 +25,25 @@ type DiskInfo struct {
 	Temperature int    `json:"temperature"` // Temperature via SMART (0 if unavailable)
 	Serial      string `json:"serial"`      // Serial number
 	Health      string `json:"health"`      // SMART status ("OK", "FAILING", "N/A")
+
+	// USB specific fields
+	USBBus     string `json:"usb_bus,omitempty"`     // USB bus number (e.g., "001")
+	USBDevice  string `json:"usb_device,omitempty"`  // USB device number (e.g., "002")
+	USBVersion string `json:"usb_version,omitempty"` // USB version (e.g., "2.0", "3.0", "3.1")
+	USBPort    string `json:"usb_port,omitempty"`    // USB port identifier (e.g., "1-2")
 }
 
 type DiskRequirement struct {
 	Name          string   `json:"name"`
-	SlotType      string   `json:"slot_type"`      // "SATA", "NVMe", "USB", "any"
-	RequiredSlots []string `json:"required_slots"` // Specific slots that must be populated
-	MinDisks      int      `json:"min_disks"`      // Minimum number of disks
-	MaxDisks      int      `json:"max_disks"`      // Maximum number of disks
-	MinSizeGB     int      `json:"min_size_gb"`    // Minimum disk size
-	MaxTempC      int      `json:"max_temp_c"`     // Maximum temperature
-	RequiredType  string   `json:"required_type"`  // Required disk type (SSD, HDD, etc.)
-	CheckSMART    bool     `json:"check_smart"`    // Whether to check SMART health
+	SlotType      string   `json:"slot_type"`             // "SATA", "NVMe", "USB", "any"
+	RequiredSlots []string `json:"required_slots"`        // Specific slots that must be populated
+	MinDisks      int      `json:"min_disks"`             // Minimum number of disks
+	MaxDisks      int      `json:"max_disks"`             // Maximum number of disks
+	MinSizeGB     int      `json:"min_size_gb"`           // Minimum disk size
+	MaxTempC      int      `json:"max_temp_c"`            // Maximum temperature
+	RequiredType  string   `json:"required_type"`         // Required disk type (SSD, HDD, etc.)
+	CheckSMART    bool     `json:"check_smart"`           // Whether to check SMART health
+	USBVersion    string   `json:"usb_version,omitempty"` // Required USB version for USB devices
 }
 
 type DiskVisual struct {
@@ -174,6 +181,12 @@ func getDiskInfo() ([]DiskInfo, error) {
 	}
 	disks = append(disks, nvmeDisks...)
 
+	usbDisks, err := getUSBDisks()
+	if err != nil {
+		printDebug(fmt.Sprintf("USB disk detection failed: %v", err))
+	}
+	disks = append(disks, usbDisks...)
+
 	for i := range disks {
 		if disks[i].IsPresent {
 			enrichDiskWithSMART(&disks[i])
@@ -191,7 +204,8 @@ func getDiskInfo() ([]DiskInfo, error) {
 func getSATADisks() ([]DiskInfo, error) {
 	var disks []DiskInfo
 
-	paths, err := filepath.Glob("/sys/class/scsi_device/*/device/block/*")
+	// Find SATA devices through SCSI subsystem, but only main devices (not partitions)
+	paths, err := filepath.Glob("/sys/class/scsi_device/*/device/block/sd[a-z]")
 	if err != nil {
 		return nil, err
 	}
@@ -207,10 +221,10 @@ func getSATADisks() ([]DiskInfo, error) {
 
 		device := "/dev/" + devName
 
-		slotType := "SATA"
-		realDevPath, err := filepath.EvalSymlinks(filepath.Join("/sys/block", devName))
-		if err == nil && strings.Contains(realDevPath, "/usb") {
-			slotType = "USB"
+		// Skip USB devices - they are handled separately
+		if isUSBDevice(devName) {
+			printDebug(fmt.Sprintf("Skipping USB device %s in SATA scan", devName))
+			continue
 		}
 
 		// Read vendor/model
@@ -220,20 +234,273 @@ func getSATADisks() ([]DiskInfo, error) {
 
 		disk := DiskInfo{
 			Slot:      hctl,
-			SlotType:  slotType,
+			SlotType:  "SATA",
 			IsPresent: true,
 			Device:    device,
 			Model:     strings.TrimSpace(vendor + " " + model),
 			Serial:    strings.TrimSpace(serial),
 			SizeGB:    getBlockDeviceSize(devName),
-			DiskType:  determineDiskType(device, slotType),
+			DiskType:  determineDiskType(device, "SATA"),
 		}
 
 		disks = append(disks, disk)
-		printDebug(fmt.Sprintf("Detected %s slot %s (%s)", slotType, hctl, devName))
+		printDebug(fmt.Sprintf("Detected SATA slot %s (%s)", hctl, devName))
 	}
 
 	return disks, nil
+}
+
+func isUSBDevice(devName string) bool {
+	// Check multiple ways to determine if device is USB
+
+	// Method 1: Check symlink path
+	realDevPath, err := filepath.EvalSymlinks(filepath.Join("/sys/block", devName))
+	if err == nil && strings.Contains(realDevPath, "/usb") {
+		return true
+	}
+
+	// Method 2: Check if device has USB subsystem
+	subsystemPath := filepath.Join("/sys/block", devName, "device/subsystem")
+	if subsystem, err := filepath.EvalSymlinks(subsystemPath); err == nil {
+		if strings.Contains(subsystem, "usb") {
+			return true
+		}
+	}
+
+	// Method 3: Check if device path contains USB controllers
+	devicePath := filepath.Join("/sys/block", devName, "device")
+	if realPath, err := filepath.EvalSymlinks(devicePath); err == nil {
+		// Look for USB identifiers in the path
+		if strings.Contains(realPath, "/usb") ||
+			regexp.MustCompile(`/\d+-\d+[:\.]`).MatchString(realPath) {
+			return true
+		}
+	}
+
+	// Method 4: Check modalias for USB
+	modaliasPath := filepath.Join("/sys/block", devName, "device/modalias")
+	if modalias := readSysFile(modaliasPath); modalias != "" {
+		if strings.HasPrefix(modalias, "usb:") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func getUSBDisks() ([]DiskInfo, error) {
+	var disks []DiskInfo
+
+	// Find USB storage devices through /sys/class/block, but only main devices (not partitions)
+	blockPaths, err := filepath.Glob("/sys/class/block/sd[a-z]")
+	if err != nil {
+		return nil, err
+	}
+
+	for _, blockPath := range blockPaths {
+		devName := filepath.Base(blockPath) // sda, sdb, etc.
+		device := "/dev/" + devName
+
+		// Only process USB devices
+		if !isUSBDevice(devName) {
+			continue
+		}
+
+		realDevPath, err := filepath.EvalSymlinks(blockPath)
+		if err != nil {
+			printDebug(fmt.Sprintf("Failed to get real path for %s: %v", devName, err))
+			continue
+		}
+
+		usbInfo, err := parseUSBDeviceInfo(realDevPath)
+		if err != nil {
+			printDebug(fmt.Sprintf("Failed to parse USB info for %s: %v", devName, err))
+			continue
+		}
+
+		// Get device vendor/model from USB attributes
+		vendor := usbInfo.Vendor
+		model := usbInfo.Product
+		if vendor == "" || model == "" {
+			// Fallback to SCSI attributes if USB attributes are missing
+			if scsiPath := findSCSIPath(realDevPath); scsiPath != "" {
+				vendor = readSysFile(filepath.Join(scsiPath, "vendor"))
+				model = readSysFile(filepath.Join(scsiPath, "model"))
+			}
+		}
+
+		// Create unique slot identifier: "USB:bus-port:version"
+		slotID := fmt.Sprintf("USB:%s-%s:%s", usbInfo.Bus, usbInfo.Port, usbInfo.Version)
+
+		disk := DiskInfo{
+			Slot:       slotID,
+			SlotType:   "USB",
+			IsPresent:  true,
+			Device:     device,
+			Model:      strings.TrimSpace(vendor + " " + model),
+			Serial:     usbInfo.Serial,
+			SizeGB:     getBlockDeviceSize(devName),
+			DiskType:   "USB",
+			USBBus:     usbInfo.Bus,
+			USBDevice:  usbInfo.Device,
+			USBVersion: usbInfo.Version,
+			USBPort:    usbInfo.Port,
+		}
+
+		disks = append(disks, disk)
+		printDebug(fmt.Sprintf("Detected USB slot %s (%s) [%s %s USB %s]", slotID, devName, vendor, model, usbInfo.Version))
+	}
+
+	return disks, nil
+}
+
+type USBDeviceInfo struct {
+	Bus     string
+	Device  string
+	Port    string
+	Version string
+	Vendor  string
+	Product string
+	Serial  string
+}
+
+func parseUSBDeviceInfo(devicePath string) (*USBDeviceInfo, error) {
+	// devicePath looks like: /sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host4/target4:0:0/4:0:0:0/block/sda
+
+	// Find USB device directory (contains bus and port info)
+	pathParts := strings.Split(devicePath, "/")
+	var usbDevPath string
+	var portPattern string
+
+	for i, part := range pathParts {
+		// Look for pattern like "1-2" (bus-port)
+		if regexp.MustCompile(`^\d+-[\d.]+$`).MatchString(part) {
+			portPattern = part
+			usbDevPath = strings.Join(pathParts[:i+1], "/")
+			break
+		}
+	}
+
+	if usbDevPath == "" || portPattern == "" {
+		return nil, fmt.Errorf("USB device path not found in %s", devicePath)
+	}
+
+	// Extract bus number from port pattern (e.g., "1-2" -> bus "1")
+	busNum := strings.Split(portPattern, "-")[0]
+
+	// Read USB device information
+	info := &USBDeviceInfo{
+		Bus:  fmt.Sprintf("%03s", busNum), // Format as 3-digit number
+		Port: portPattern,
+	}
+
+	// Read USB version
+	if version := readSysFile(filepath.Join(usbDevPath, "version")); version != "" {
+		info.Version = parseUSBVersion(version)
+	} else if speed := readSysFile(filepath.Join(usbDevPath, "speed")); speed != "" {
+		info.Version = speedToUSBVersion(speed)
+	}
+
+	// Read vendor and product info
+	if vendor := readSysFile(filepath.Join(usbDevPath, "manufacturer")); vendor != "" {
+		info.Vendor = vendor
+	}
+	if product := readSysFile(filepath.Join(usbDevPath, "product")); product != "" {
+		info.Product = product
+	}
+	if serial := readSysFile(filepath.Join(usbDevPath, "serial")); serial != "" {
+		info.Serial = serial
+	}
+
+	// Get device number from bus devices
+	if devNum := findUSBDeviceNumber(busNum, usbDevPath); devNum != "" {
+		info.Device = fmt.Sprintf("%03s", devNum)
+	}
+
+	return info, nil
+}
+
+func parseUSBVersion(versionStr string) string {
+	// Version string format: " 2.00", " 3.00", etc.
+	versionStr = strings.TrimSpace(versionStr)
+	if versionStr == "" {
+		return "Unknown"
+	}
+
+	switch {
+	case strings.HasPrefix(versionStr, "1."):
+		return "1.1"
+	case strings.HasPrefix(versionStr, "2."):
+		return "2.0"
+	case strings.HasPrefix(versionStr, "3.0"):
+		return "3.0"
+	case strings.HasPrefix(versionStr, "3.1"):
+		return "3.1"
+	case strings.HasPrefix(versionStr, "3.2"):
+		return "3.2"
+	case strings.HasPrefix(versionStr, "3."):
+		return "3.0"
+	default:
+		return versionStr
+	}
+}
+
+func speedToUSBVersion(speedStr string) string {
+	// Speed in Mbps: 1.5, 12, 480, 5000, 10000, etc.
+	speedStr = strings.TrimSpace(speedStr)
+	if speedStr == "" {
+		return "Unknown"
+	}
+
+	if speed, err := strconv.ParseFloat(speedStr, 64); err == nil {
+		switch {
+		case speed <= 12:
+			return "1.1"
+		case speed <= 480:
+			return "2.0"
+		case speed <= 5000:
+			return "3.0"
+		case speed <= 10000:
+			return "3.1"
+		default:
+			return "3.2"
+		}
+	}
+
+	return "Unknown"
+}
+
+func findUSBDeviceNumber(busNum, usbDevPath string) string {
+	// Try to find device number by looking at /dev/bus/usb/BUS/
+	busDirPath := fmt.Sprintf("/dev/bus/usb/%s", busNum)
+	if busDir, err := os.ReadDir(busDirPath); err == nil {
+		for _, entry := range busDir {
+			devPath := filepath.Join(busDirPath, entry.Name())
+			if devRealPath, err := filepath.EvalSymlinks(devPath); err == nil {
+				if strings.Contains(devRealPath, filepath.Base(usbDevPath)) {
+					return entry.Name()
+				}
+			}
+		}
+	}
+
+	// Fallback: read devnum file
+	if devNum := readSysFile(filepath.Join(usbDevPath, "devnum")); devNum != "" {
+		return devNum
+	}
+
+	return "000"
+}
+
+func findSCSIPath(devicePath string) string {
+	// Find SCSI device path for getting vendor/model info
+	pathParts := strings.Split(devicePath, "/")
+	for i, part := range pathParts {
+		if regexp.MustCompile(`^\d+:\d+:\d+:\d+$`).MatchString(part) {
+			return strings.Join(pathParts[:i+1], "/")
+		}
+	}
+	return ""
 }
 
 func getNVMeDisks() ([]DiskInfo, error) {
@@ -332,20 +599,6 @@ func determineDiskType(device, slotType string) string {
 	return "Unknown"
 }
 
-func enrichDiskWithSMART(disk *DiskInfo) {
-	if disk.SlotType == "USB" {
-		// USB devices typically don't support SMART
-		disk.Health = "N/A"
-		return
-	}
-
-	// Get SMART health
-	disk.Health = getSMARTHealth(disk.Device)
-
-	// Get temperature
-	disk.Temperature = getSMARTTemperature(disk.Device)
-}
-
 func getSMARTHealth(device string) string {
 	cmd := exec.Command("smartctl", "-H", device)
 	output, err := cmd.Output()
@@ -362,7 +615,110 @@ func getSMARTHealth(device string) string {
 	return "N/A"
 }
 
-func getSMARTTemperature(device string) int {
+func parseTemperatureFromLines(lines []string) int {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+
+		// Method 1: Standard ATA temperature attribute (ID 194)
+		if strings.Contains(lower, "temperature") && strings.Contains(line, "194") {
+			if temp := parseATATemperatureLine(line); temp > 0 {
+				return temp
+			}
+		}
+
+		// Method 2: Other temperature attribute IDs (190, 231)
+		if (strings.Contains(line, "190") || strings.Contains(line, "231")) && strings.Contains(lower, "temp") {
+			if temp := parseATATemperatureLine(line); temp > 0 {
+				return temp
+			}
+		}
+
+		// Method 3: NVMe style temperature reporting
+		if strings.Contains(line, "Temperature:") && strings.Contains(line, "Celsius") {
+			re := regexp.MustCompile(`Temperature:\s+(\d+)\s+Celsius`)
+			if matches := re.FindStringSubmatch(line); len(matches) == 2 {
+				if val, err := strconv.Atoi(matches[1]); err == nil && val > 0 && val < 150 {
+					return val
+				}
+			}
+		}
+
+		// Method 4: Alternative temperature formats
+		// "Temperature_Celsius"
+		if strings.Contains(lower, "temperature_celsius") {
+			if temp := parseATATemperatureLine(line); temp > 0 {
+				return temp
+			}
+		}
+
+		// Method 5: Airflow temperature (some drives)
+		if strings.Contains(lower, "airflow_temperature") {
+			if temp := parseATATemperatureLine(line); temp > 0 {
+				return temp
+			}
+		}
+
+		// Method 6: Drive temperature (some Samsung drives)
+		if strings.Contains(lower, "drive_temperature") {
+			if temp := parseATATemperatureLine(line); temp > 0 {
+				return temp
+			}
+		}
+
+		// Method 7: Simple "Temperature" anywhere in line with number
+		if strings.Contains(lower, "temperature") {
+			// Look for temperature value in the line
+			re := regexp.MustCompile(`(\d+)\s*°?c`)
+			if matches := re.FindStringSubmatch(lower); len(matches) >= 2 {
+				if val, err := strconv.Atoi(matches[1]); err == nil && val > 0 && val < 150 {
+					return val
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+func parseATATemperatureLine(line string) int {
+	// Parse ATA SMART attribute line
+	// Format: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
+	fields := strings.Fields(line)
+
+	if len(fields) >= 10 {
+		// Try raw value (last field)
+		raw := fields[len(fields)-1]
+
+		// Raw value might be "45 (Min/Max 20/46)" - extract first number
+		if temp := extractFirstNumber(raw); temp > 0 && temp < 150 {
+			return temp
+		}
+	}
+
+	if len(fields) >= 6 {
+		// Try VALUE field (5th field, index 4)
+		if val, err := strconv.Atoi(fields[4]); err == nil && val > 0 && val < 150 {
+			return val
+		}
+	}
+
+	return 0
+}
+
+func extractFirstNumber(str string) int {
+	// Extract first number from string like "45 (Min/Max 20/46)" or "45"
+	re := regexp.MustCompile(`(\d+)`)
+	if matches := re.FindStringSubmatch(str); len(matches) >= 2 {
+		if val, err := strconv.Atoi(matches[1]); err == nil {
+			return val
+		}
+	}
+	return 0
+}
+
+func getNVMeTemperature(device string) int {
+	// Try NVMe specific temperature command
 	cmd := exec.Command("smartctl", "-A", device)
 	output, err := cmd.Output()
 	if err != nil {
@@ -371,28 +727,97 @@ func getSMARTTemperature(device string) int {
 
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
-		lower := strings.ToLower(line)
-		// For ATA: look for RAW_VALUE column
-		if strings.Contains(lower, "temperature") && strings.Contains(line, "194") {
-			fields := strings.Fields(line)
-			if len(fields) >= 10 {
-				raw := fields[len(fields)-1]
-				if val, err := strconv.Atoi(raw); err == nil && val > 0 && val < 100 {
+		// Look for NVMe temperature sensor
+		if strings.Contains(line, "Temperature Sensor") || strings.Contains(line, "Composite") {
+			// Format: "Temperature Sensor 1:           45 Celsius"
+			re := regexp.MustCompile(`(\d+)\s+Celsius`)
+			if matches := re.FindStringSubmatch(line); len(matches) >= 2 {
+				if val, err := strconv.Atoi(matches[1]); err == nil && val > 0 && val < 150 {
 					return val
 				}
 			}
 		}
-		// For NVMe: direct format
-		if strings.Contains(line, "Temperature:") && strings.Contains(line, "Celsius") {
-			re := regexp.MustCompile(`Temperature:\s+(\d+)\s+Celsius`)
-			matches := re.FindStringSubmatch(line)
-			if len(matches) == 2 {
-				if val, err := strconv.Atoi(matches[1]); err == nil {
+
+		// Alternative NVMe format: "Current Temperature:                    45 Celsius"
+		if strings.Contains(line, "Current Temperature") {
+			re := regexp.MustCompile(`(\d+)\s+Celsius`)
+			if matches := re.FindStringSubmatch(line); len(matches) >= 2 {
+				if val, err := strconv.Atoi(matches[1]); err == nil && val > 0 && val < 150 {
 					return val
 				}
 			}
 		}
 	}
+
+	return 0
+}
+
+func enrichDiskWithSMART(disk *DiskInfo) {
+	if disk.SlotType == "USB" {
+		// USB devices typically don't support SMART
+		disk.Health = "N/A"
+		return
+	}
+
+	// Get SMART health
+	disk.Health = getSMARTHealth(disk.Device)
+
+	// Get temperature with improved detection
+	disk.Temperature = getSMARTTemperature(disk.Device)
+
+	if debugMode && disk.Temperature == 0 {
+		printDebug(fmt.Sprintf("Failed to detect temperature for %s (%s), trying manual smartctl check", disk.Device, disk.Model))
+
+		// In debug mode, show what smartctl actually returns
+		cmd := exec.Command("smartctl", "-A", disk.Device)
+		if output, err := cmd.Output(); err == nil {
+			lines := strings.Split(string(output), "\n")
+			printDebug("Available SMART attributes:")
+			for _, line := range lines {
+				if strings.Contains(strings.ToLower(line), "temp") {
+					printDebug(fmt.Sprintf("  %s", line))
+				}
+			}
+		}
+	}
+}
+
+func getSMARTTemperature(device string) int {
+	cmd := exec.Command("smartctl", "-A", device)
+	output, err := cmd.Output()
+	if err != nil {
+		// Try with different options for some devices
+		cmd = exec.Command("smartctl", "-a", device)
+		if output2, err2 := cmd.Output(); err2 == nil {
+			output = output2
+		} else {
+			return 0
+		}
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	if debugMode {
+		printDebug(fmt.Sprintf("SMART output for %s:", device))
+		for _, line := range lines {
+			if strings.Contains(strings.ToLower(line), "temp") {
+				printDebug(fmt.Sprintf("  Temperature line: %s", line))
+			}
+		}
+	}
+
+	// Try multiple temperature detection methods
+	temp := parseTemperatureFromLines(lines)
+	if temp > 0 {
+		return temp
+	}
+
+	// If standard parsing failed, try NVMe specific command
+	if strings.Contains(device, "nvme") {
+		return getNVMeTemperature(device)
+	}
+
 	return 0
 }
 
@@ -480,8 +905,14 @@ func createDefaultConfig(configPath string) error {
 	for i, disk := range disks {
 		if disk.IsPresent {
 			installedDisks++
-			printInfo(fmt.Sprintf("  Slot %s (%s): %s %s %dGB",
-				disk.Slot, disk.SlotType, disk.DiskType, disk.Model, disk.SizeGB))
+			if disk.SlotType == "USB" {
+				printInfo(fmt.Sprintf("  Slot %s (USB %s): %s %s %dGB [Bus:%s Device:%s Port:%s]",
+					disk.Slot, disk.USBVersion, disk.DiskType, disk.Model, disk.SizeGB,
+					disk.USBBus, disk.USBDevice, disk.USBPort))
+			} else {
+				printInfo(fmt.Sprintf("  Slot %s (%s): %s %s %dGB",
+					disk.Slot, disk.SlotType, disk.DiskType, disk.Model, disk.SizeGB))
+			}
 			if disk.Temperature > 0 {
 				printInfo(fmt.Sprintf("    Temperature: %d°C", disk.Temperature))
 			}
@@ -502,16 +933,34 @@ func createDefaultConfig(configPath string) error {
 
 	printInfo(fmt.Sprintf("Total installed disks: %d", installedDisks))
 
-	// Group disks by slot type
+	// Group disks by slot type, and USB devices by version
 	slotTypeGroups := make(map[string][]DiskInfo)
 	for _, disk := range disks {
-		slotTypeGroups[disk.SlotType] = append(slotTypeGroups[disk.SlotType], disk)
+		groupKey := disk.SlotType
+
+		// For USB devices, create separate groups by version
+		if disk.SlotType == "USB" && disk.USBVersion != "" {
+			groupKey = fmt.Sprintf("USB_%s", disk.USBVersion)
+		}
+
+		slotTypeGroups[groupKey] = append(slotTypeGroups[groupKey], disk)
 	}
 
 	var requirements []DiskRequirement
-	for slotType, disksOfType := range slotTypeGroups {
+	for groupKey, disksOfType := range slotTypeGroups {
 		installedOfType := 0
 		var requiredSlots []string
+
+		// Determine the actual slot type and USB version
+		slotType := "Unknown"
+		usbVersion := ""
+
+		if strings.HasPrefix(groupKey, "USB_") {
+			slotType = "USB"
+			usbVersion = strings.TrimPrefix(groupKey, "USB_")
+		} else {
+			slotType = groupKey
+		}
 
 		for _, disk := range disksOfType {
 			if disk.IsPresent {
@@ -521,8 +970,15 @@ func createDefaultConfig(configPath string) error {
 		}
 
 		if installedOfType > 0 {
+			var reqName string
+			if usbVersion != "" {
+				reqName = fmt.Sprintf("USB %s disks (%d installed)", usbVersion, installedOfType)
+			} else {
+				reqName = fmt.Sprintf("%s disks (%d installed)", slotType, installedOfType)
+			}
+
 			req := DiskRequirement{
-				Name:          fmt.Sprintf("%s disks (%d installed)", slotType, installedOfType),
+				Name:          reqName,
 				SlotType:      slotType,
 				RequiredSlots: requiredSlots,
 				MinDisks:      installedOfType,
@@ -530,6 +986,13 @@ func createDefaultConfig(configPath string) error {
 				MaxTempC:      70,                // Maximum 70°C
 				CheckSMART:    slotType != "USB", // No SMART for USB
 			}
+
+			// Add USB version requirement for USB devices
+			if slotType == "USB" && usbVersion != "" {
+				req.USBVersion = usbVersion
+				printInfo(fmt.Sprintf("  USB %s version requirement created", usbVersion))
+			}
+
 			requirements = append(requirements, req)
 		}
 	}
@@ -573,7 +1036,7 @@ func createDefaultConfig(configPath string) error {
 			TypeVisuals: typeVisuals,
 			SlotMapping: slotMapping,
 			TotalSlots:  len(disks),
-			SlotWidth:   10,
+			SlotWidth:   12, // Increase width for USB info
 			SlotsPerRow: 6,
 			CustomRows:  generateDefaultCustomRows(len(disks)),
 		},
@@ -600,6 +1063,7 @@ func createDefaultConfig(configPath string) error {
 	printSuccess("Configuration created successfully based on detected hardware")
 	printInfo(fmt.Sprintf("Total disk slots: %d", len(disks)))
 	printInfo(fmt.Sprintf("Installed disks: %d", installedDisks))
+	printInfo("USB devices grouped by version for accurate requirements")
 	printInfo("Custom row layout generated (disabled by default)")
 	printInfo("To enable custom rows: set 'visualization.custom_rows.enabled' to true")
 
@@ -695,6 +1159,14 @@ func checkDiskAgainstRequirements(disks []DiskInfo, config *Config) DiskCheckRes
 				hasErrors = true
 			}
 
+			// Check USB version for USB devices
+			if req.SlotType == "USB" && req.USBVersion != "" && disk.USBVersion != req.USBVersion {
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("USB disk %s: USB %s (required USB %s)", disk.Slot, disk.USBVersion, req.USBVersion))
+				result.TypeOK = false
+				hasErrors = true
+			}
+
 			// Check SMART health
 			if config.CheckSMART && req.CheckSMART && disk.Health == "FAILING" {
 				result.Issues = append(result.Issues,
@@ -735,6 +1207,11 @@ func filterDisks(disks []DiskInfo, req DiskRequirement) []DiskInfo {
 	for _, disk := range disks {
 		// Check slot type
 		if req.SlotType != "" && req.SlotType != "any" && disk.SlotType != req.SlotType {
+			continue
+		}
+
+		// For USB devices, check version if specified
+		if req.SlotType == "USB" && req.USBVersion != "" && disk.USBVersion != req.USBVersion {
 			continue
 		}
 
@@ -802,7 +1279,39 @@ func formatTemp(temp int) string {
 	return fmt.Sprintf("%d°C", temp)
 }
 
+func getExpectedUSBVersion(slotName string, requirements []DiskRequirement) string {
+	for _, req := range requirements {
+		if req.SlotType == "USB" && req.USBVersion != "" {
+			for _, reqSlot := range req.RequiredSlots {
+				if reqSlot == slotName {
+					return req.USBVersion
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func shortenSlotName(slot string) string {
+	// For USB slots like "USB:001-1-2:3.0", show as "USB1-2:3.0"
+	if strings.HasPrefix(slot, "USB:") {
+		parts := strings.Split(slot, ":")
+		if len(parts) == 3 {
+			busPort := parts[1] // "001-1-2"
+			version := parts[2] // "3.0"
+
+			// Extract port part (remove bus prefix)
+			if strings.Contains(busPort, "-") {
+				portParts := strings.Split(busPort, "-")
+				if len(portParts) >= 2 {
+					port := strings.Join(portParts[1:], "-") // "1-2"
+					return fmt.Sprintf("USB%s:%s", port, version)
+				}
+			}
+			return fmt.Sprintf("USB:%s", version)
+		}
+	}
+
 	// For HCTL addresses like "1:0:0:0", show as "1:0:0:0" or abbreviated
 	if regexp.MustCompile(`^\d+:\d+:\d+:\d+$`).MatchString(slot) {
 		parts := strings.Split(slot, ":")
@@ -819,9 +1328,9 @@ func shortenSlotName(slot string) string {
 		}
 	}
 
-	// Fallback: take first 8 characters
-	if len(slot) > 8 {
-		return slot[:8]
+	// Fallback: take first 10 characters
+	if len(slot) > 10 {
+		return slot[:10]
 	}
 	return slot
 }
@@ -955,7 +1464,20 @@ func visualizeSlots(disks []DiskInfo, config *Config) error {
 					fmt.Print(ColorGreen + txt + ColorReset)
 				}
 			} else {
-				fmt.Print(strings.Repeat(" ", width))
+				slotName := posToSlot[idx]
+				if required[slotName] {
+					// Show expected type for missing required slot
+					expectedUSBVer := getExpectedUSBVersion(slotName, config.DiskRequirements)
+					if expectedUSBVer != "" {
+						txt := centerText("USB", width)
+						fmt.Print(ColorRed + txt + ColorReset)
+					} else {
+						txt := centerText("MISS", width)
+						fmt.Print(ColorRed + txt + ColorReset)
+					}
+				} else {
+					fmt.Print(strings.Repeat(" ", width))
+				}
 			}
 			fmt.Print("│")
 		}
@@ -979,6 +1501,47 @@ func visualizeSlots(disks []DiskInfo, config *Config) error {
 			fmt.Print("│")
 		}
 		fmt.Println()
+
+		// USB Version row (for USB devices and expected USB)
+		hasUSBOrExpected := false
+		for i := 0; i < count; i++ {
+			idx := start + i
+			disk := slotData[idx]
+			slotName := posToSlot[idx]
+			expectedUSBVer := getExpectedUSBVersion(slotName, config.DiskRequirements)
+
+			if (disk.IsPresent && disk.SlotType == "USB") || expectedUSBVer != "" {
+				hasUSBOrExpected = true
+				break
+			}
+		}
+
+		if hasUSBOrExpected {
+			fmt.Print("│")
+			for i := 0; i < count; i++ {
+				idx := start + i
+				disk := slotData[idx]
+				slotName := posToSlot[idx]
+				expectedUSBVer := getExpectedUSBVersion(slotName, config.DiskRequirements)
+
+				if disk.IsPresent && disk.SlotType == "USB" {
+					txt := centerText("USB "+disk.USBVersion, width)
+					if systemResult.Status == "error" {
+						fmt.Print(ColorYellow + txt + ColorReset)
+					} else {
+						fmt.Print(ColorGreen + txt + ColorReset)
+					}
+				} else if expectedUSBVer != "" {
+					// Show expected USB version for missing USB slot
+					txt := centerText("USB "+expectedUSBVer, width)
+					fmt.Print(ColorRed + txt + ColorReset)
+				} else {
+					fmt.Print(strings.Repeat(" ", width))
+				}
+				fmt.Print("│")
+			}
+			fmt.Println()
+		}
 
 		// Temperature row (if enabled)
 		if config.CheckTemperature {
@@ -1056,7 +1619,6 @@ func getDiskVisual(disk DiskInfo, config *VisualizationConfig) DiskVisual {
 		diskType = "Unknown"
 	}
 
-	// 💥 вот здесь может быть ошибка: ты можешь иметь disk.DiskType == "NVMe", но в config.TypeVisuals только "SSD"
 	if visual, exists := config.TypeVisuals[diskType]; exists {
 		return visual
 	}
@@ -1090,7 +1652,13 @@ func checkDisk(config *Config) error {
 	for i, disk := range disks {
 		if disk.IsPresent {
 			installedCount++
-			printInfo(fmt.Sprintf("Slot %d (%s): %s %s %s", i+1, disk.Slot, disk.DiskType, disk.Model, formatSize(disk.SizeGB)))
+			if disk.SlotType == "USB" {
+				printInfo(fmt.Sprintf("Slot %d (%s): %s %s %s [USB %s Bus:%s Device:%s]",
+					i+1, disk.Slot, disk.DiskType, disk.Model, formatSize(disk.SizeGB),
+					disk.USBVersion, disk.USBBus, disk.USBDevice))
+			} else {
+				printInfo(fmt.Sprintf("Slot %d (%s): %s %s %s", i+1, disk.Slot, disk.DiskType, disk.Model, formatSize(disk.SizeGB)))
+			}
 			if disk.Temperature > 0 {
 				printDebug(fmt.Sprintf("  Temperature: %d°C", disk.Temperature))
 			}
@@ -1181,6 +1749,15 @@ func main() {
 					fmt.Printf("  Serial: %s\n", disk.Serial)
 					fmt.Printf("  Temperature: %s\n", formatTemp(disk.Temperature))
 					fmt.Printf("  Health: %s\n", disk.Health)
+
+					// USB specific information
+					if disk.SlotType == "USB" {
+						fmt.Printf("  USB Bus: %s\n", disk.USBBus)
+						fmt.Printf("  USB Device: %s\n", disk.USBDevice)
+						fmt.Printf("  USB Version: %s\n", disk.USBVersion)
+						fmt.Printf("  USB Port: %s\n", disk.USBPort)
+					}
+
 					installedCount++
 				}
 			}
