@@ -23,4 +23,9 @@ build_firestarter:
 	(cd source/firestarter && go build -o firestarter main.go)
 	mv source/firestarter/firestarter bin/
 
-build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter
+build_disk_test:
+	(cd source/disk_test && go mod tidy)
+	(cd source/disk_test && go build -o disk_test main.go)
+	mv source/disk_test/disk_test bin/
+
+build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test
