@@ -28,4 +28,9 @@ build_disk_test:
 	(cd source/disk_test && go build -o disk_test main.go)
 	mv source/disk_test/disk_test bin/
 
-build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test
+build_network_test:
+	(cd source/network_test && go mod tidy)
+	(cd source/network_test && go build -o network_test main.go)
+	mv source/network_test/network_test bin/
+
+build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test build_network_test
