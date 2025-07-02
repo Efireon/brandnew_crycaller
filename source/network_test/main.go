@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-ping/ping"
 	"github.com/safchain/ethtool"
 	"github.com/vishvananda/netlink"
 )
@@ -264,11 +263,20 @@ func getNetworkInterfaces() ([]NetworkInterface, error) {
 		}
 
 		// Speed
-		if ethTool != nil {
+		speedPath := fmt.Sprintf("/sys/class/net/%s/speed", name)
+		if data, err := os.ReadFile(speedPath); err == nil {
+			s := strings.TrimSpace(string(data))
+			if sp, err := strconv.Atoi(s); err == nil && sp >= 0 {
+				iface.Speed = fmt.Sprintf("%dMb/s", sp)
+			} else {
+				iface.Speed = "unknown"
+			}
+		} else if ethTool != nil {
+			// fallback: старая логика ethtool.Stats, если sysfs недоступен
 			stats, err := ethTool.Stats(name)
 			if err == nil {
-				if speed, ok := stats["Speed"]; ok && speed > 0 {
-					iface.Speed = fmt.Sprintf("%dMb/s", speed)
+				if speedVal, ok := stats["Speed"]; ok && speedVal > 0 {
+					iface.Speed = fmt.Sprintf("%dMb/s", speedVal)
 				} else {
 					iface.Speed = "unknown"
 				}
@@ -546,173 +554,156 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func pingInterface(interfaceName, target string, timeout int, retries int) PingResult {
+var (
+	// паттерны для разбора строки packet loss и строки rtt
+	lossRe = regexp.MustCompile(`, (\d+)% packet loss`)
+	rttRe  = regexp.MustCompile(`rtt [^=]+= [\d\.]+/([\d\.]+)/`)
+)
+
+func pingInterface(interfaceName, target string, timeoutSec, retries int) PingResult {
 	result := PingResult{
 		Target:    target,
 		Interface: interfaceName,
-		Success:   false,
 	}
 
-	iface, err := net.InterfaceByName(interfaceName)
-	if err != nil {
-		result.Error = fmt.Sprintf("interface not found: %v", err)
-		return result
-	}
-
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		result.Error = "no IP address assigned"
-		return result
-	}
-
-	srcIP, _, err := net.ParseCIDR(addrs[0].String())
-	if err != nil {
-		result.Error = fmt.Sprintf("invalid IP format: %v", err)
-		return result
-	}
-
-	maxAttempts := retries + 1
-	var bestLoss float64 = 100.0
-	var bestRTT time.Duration
+	attempts := retries + 1
+	bestLoss := 100.0
 	var lastErr error
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		pinger, err := ping.NewPinger(target)
+	for i := 0; i < attempts; i++ {
+		// запускаем: ping -I <iface> -c 1 -W <timeout> <target>
+		cmd := exec.Command(
+			"ping",
+			"-I", interfaceName,
+			"-c", "1",
+			"-W", strconv.Itoa(timeoutSec),
+			target,
+		)
+		out, err := cmd.CombinedOutput()
+		text := string(out)
+
 		if err != nil {
 			lastErr = err
-			continue
 		}
 
-		pinger.SetPrivileged(true)
-		pinger.Source = srcIP.String()
-		pinger.Count = 3
-		pinger.Timeout = time.Duration(timeout) * time.Second
-
-		err = pinger.Run()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		stats := pinger.Statistics()
-		if stats.PacketLoss < 100.0 {
-			return PingResult{
-				Target:    target,
-				Interface: interfaceName,
-				Success:   true,
-				Loss:      stats.PacketLoss,
-				AvgTime:   float64(stats.AvgRtt.Milliseconds()),
+		// разбираем packet loss
+		loss := 100.0
+		if m := lossRe.FindStringSubmatch(text); m != nil {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+				loss = v
 			}
 		}
 
-		// Keep best attempt
-		if stats.PacketLoss < bestLoss {
-			bestLoss = stats.PacketLoss
-			bestRTT = stats.AvgRtt
+		// разбираем avg RTT
+		avgRTT := 0.0
+		if m := rttRe.FindStringSubmatch(text); m != nil {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+				avgRTT = v
+			}
 		}
 
+		// сохраняем лучший (минимальный) loss
+		if loss < bestLoss {
+			bestLoss = loss
+			result.Loss = loss
+			result.AvgTime = avgRTT
+		}
+
+		// если хоть что-то дошло — успех
+		if loss < 100.0 {
+			result.Success = true
+			return result
+		}
+
+		// небольшая пауза между попытками
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// All attempts failed
-	result.Loss = bestLoss
-	result.AvgTime = float64(bestRTT.Milliseconds())
+	// ни один пакет не дошёл
+	result.Success = false
 	result.Error = fmt.Sprintf("all attempts failed: %v", lastErr)
+	result.Loss = bestLoss
 	return result
 }
 
-func testInterfacePing(iface NetworkInterface, targets []string, timeout int, retries int) []PingResult {
+func testInterfacePing(iface NetworkInterface, targets []string, timeoutSec, retries int) []PingResult {
+	// If interface is down or has no IP, return failures
 	if iface.State != "UP" || iface.IP == "" {
-		var results []PingResult
-		for _, target := range targets {
-			results = append(results, PingResult{
+		results := make([]PingResult, len(targets))
+		for i, target := range targets {
+			results[i] = PingResult{
 				Target:    target,
 				Interface: iface.Name,
 				Success:   false,
 				Error:     "Interface down or no IP",
-			})
+			}
 		}
 		return results
 	}
 
-	// Parallel ping execution
+	// Sequential ping execution with direct slice population
 	results := make([]PingResult, len(targets))
-	var wg sync.WaitGroup
-
 	for i, target := range targets {
-		wg.Add(1)
-		go func(idx int, tgt string) {
-			defer wg.Done()
-
-			printDebugSafe(fmt.Sprintf("Pinging %s via %s...", tgt, iface.Name))
-			result := pingInterface(iface.Name, tgt, timeout, retries)
-			results[idx] = result
-
-			if result.Success {
-				printDebugSafe(fmt.Sprintf("  %s via %s: %.1fms (%.0f%% loss)", tgt, iface.Name, result.AvgTime, result.Loss))
-			} else {
-				printDebugSafe(fmt.Sprintf("  %s via %s: %s", tgt, iface.Name, result.Error))
-			}
-		}(i, target)
+		printDebugSafe(fmt.Sprintf("Pinging %s via %s...", target, iface.Name))
+		pr := pingInterface(iface.Name, target, timeoutSec, retries)
+		results[i] = pr
+		if pr.Success {
+			printDebugSafe(fmt.Sprintf("  %s via %s: %.1fms (%.0f%% loss)",
+				pr.Target, iface.Name, pr.AvgTime, pr.Loss))
+		} else {
+			printDebugSafe(fmt.Sprintf("  %s via %s: %s",
+				pr.Target, iface.Name, pr.Error))
+		}
 	}
-
-	wg.Wait()
 	return results
 }
 
 func testRequirementPingParallel(matchingInterfaces []NetworkInterface, req NetworkRequirement, config *Config) map[string][]PingResult {
 	results := make(map[string][]PingResult)
 
-	// Filter interfaces that need ping testing
-	var testInterfaces []NetworkInterface
+	// Filter valid interfaces for ping
+	var testIfaces []NetworkInterface
 	for _, iface := range matchingInterfaces {
 		if iface.Type != "Loopback" && iface.Type != "Virtual" && iface.State == "UP" {
-			testInterfaces = append(testInterfaces, iface)
+			testIfaces = append(testIfaces, iface)
 		}
 	}
-
-	if len(testInterfaces) == 0 {
+	if len(testIfaces) == 0 {
 		return results
 	}
 
-	// Get retry count from config
 	retries := config.PingRetries
 	if retries < 0 {
-		retries = 0 // No retries
+		retries = 0
 	}
 
-	// Parallel execution for all interfaces in this requirement
-	resultChan := make(chan struct {
-		InterfaceName string
-		PingResults   []PingResult
-	}, len(testInterfaces))
-
+	// Channel for collecting interface results
+	type ifaceResult struct {
+		name    string
+		results []PingResult
+	}
+	resultChan := make(chan ifaceResult, len(testIfaces))
 	var wg sync.WaitGroup
 
-	for _, iface := range testInterfaces {
+	// Launch one goroutine per interface
+	for _, iface := range testIfaces {
 		wg.Add(1)
-		go func(testIface NetworkInterface) {
+		go func(iface NetworkInterface) {
 			defer wg.Done()
-
-			pingResults := testInterfacePing(testIface, req.PingTargets, req.PingTimeout, retries)
-			resultChan <- struct {
-				InterfaceName string
-				PingResults   []PingResult
-			}{
-				InterfaceName: testIface.Name,
-				PingResults:   pingResults,
-			}
+			pingResults := testInterfacePing(iface, req.PingTargets, req.PingTimeout, retries)
+			resultChan <- ifaceResult{name: iface.Name, results: pingResults}
 		}(iface)
 	}
 
+	// Wait and close channel
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
-	// Collect results
-	for result := range resultChan {
-		results[result.InterfaceName] = result.PingResults
+	// Collect all
+	for res := range resultChan {
+		results[res.name] = res.results
 	}
 
 	return results
@@ -1391,7 +1382,7 @@ func testAllInterfacesPing(interfaces []NetworkInterface, config *Config) error 
 
 	// Start ping tests for all interfaces in parallel
 	for _, iface := range testInterfaces {
-		wg.Add(1)
+		wg.Add(4)
 		go func(testIface NetworkInterface) {
 			defer wg.Done()
 
