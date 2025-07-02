@@ -33,4 +33,10 @@ build_network_test:
 	(cd source/network_test && go build -o network_test main.go)
 	mv source/network_test/network_test bin/
 
-build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test build_network_test
+build_power_test:
+	(cd source/power_test && go mod tidy)
+	(cd source/power_test && go build -o power_test main.go)
+	mv source/power_test/power_test bin/
+
+
+build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test build_network_test build_power_test
