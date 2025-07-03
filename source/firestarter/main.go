@@ -463,18 +463,6 @@ func printExecutionSummary(allResults []TestResult, flashResults []FlashResult, 
 					}())
 			}
 		}
-
-		// А теперь детальный вывод всех упавших тестов
-		fmt.Println("\nDETAILS OF FAILED TESTS:")
-		printSeparator()
-		for _, result := range allResults {
-			if result.Status == "FAILED" || result.Status == "TIMEOUT" {
-				fmt.Printf("\n%s OUTPUT FOR %s:%s\n", ColorWhite, result.Name, ColorReset)
-				printSeparator()
-				fmt.Print(result.Output)
-				printSeparator()
-			}
-		}
 	}
 }
 
