@@ -2874,7 +2874,7 @@ func main() {
 		os.Exit(0)
 	}
 	if showVersion {
-		fmt.Printf("FIRESTARTER v%s\n", VERSION)
+		fmt.Println(VERSION)
 		os.Exit(0)
 	}
 

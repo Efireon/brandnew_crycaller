@@ -140,7 +140,7 @@ func printError(message string) {
 }
 
 func showHelp() {
-	fmt.Printf("Power Monitor %s\n", VERSION)
+	fmt.Printf("Version %s\n", VERSION)
 	fmt.Println("Parameters:")
 	fmt.Println("  -V          Show program version")
 	fmt.Println("  -c <path>   Path to configuration file (default: power_config.json)")
@@ -1423,7 +1423,7 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Printf("Power Monitor %s\n", VERSION)
+		fmt.Println(VERSION)
 		return
 	}
 
