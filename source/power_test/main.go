@@ -599,6 +599,7 @@ func loadConfig(path string) (*Config, error) {
 }
 
 // Исправленная функция проверки требований
+// Исправленная функция проверки требований
 func checkPowerAgainstRequirements(powers []PowerInfo, config *Config) PowerCheckResult {
 	result := PowerCheckResult{
 		Status:      "ok",
@@ -615,6 +616,20 @@ func checkPowerAgainstRequirements(powers []PowerInfo, config *Config) PowerChec
 
 	hasErrors := false
 	hasWarnings := false
+
+	// Проверяем, что все ожидаемые сенсоры присутствуют
+	found := make(map[string]bool)
+	for _, power := range powers {
+		found[power.Position] = true
+	}
+
+	for expectedPos := range config.Visualization.PositionToSlot {
+		if !found[expectedPos] {
+			result.Issues = append(result.Issues,
+				fmt.Sprintf("Required sensor at position %s is missing", expectedPos))
+			hasErrors = true
+		}
+	}
 
 	for _, req := range config.PowerRequirements {
 		matchingPowers := filterPowers(powers, req)
@@ -962,7 +977,7 @@ func visualizeSlots(powers []PowerInfo, config *Config) error {
 		}
 	}
 
-	// Legend…
+	// Legend
 	printInfo("Legend:")
 	fmt.Printf("  %s▓▓▓%s Present & OK    ", ColorGreen, ColorReset)
 	fmt.Printf("  %s▓▓▓%s Issues    ", ColorYellow, ColorReset)
@@ -1111,6 +1126,25 @@ func visualizeSlots(powers []PowerInfo, config *Config) error {
 			fmt.Print(centerText(pos, width+1))
 		}
 		fmt.Print(" (Position)\n\n")
+	}
+
+	// Выполняем основную проверку для получения общего результата
+	printInfo("Overall Power Check:")
+	checkResult := checkPowerAgainstRequirements(powers, config)
+
+	if checkResult.Status == "error" {
+		printError("POWER CHECK FAILED")
+		for _, issue := range checkResult.Issues {
+			printError(fmt.Sprintf("  - %s", issue))
+		}
+		return fmt.Errorf("power check failed with %d issues", len(checkResult.Issues))
+	} else if checkResult.Status == "warning" {
+		printWarning("POWER CHECK COMPLETED WITH WARNINGS")
+		for _, issue := range checkResult.Issues {
+			printWarning(fmt.Sprintf("  - %s", issue))
+		}
+	} else {
+		printSuccess("POWER CHECK PASSED")
 	}
 
 	printSuccess("Custom rows layout rendered!")
