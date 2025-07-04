@@ -145,10 +145,11 @@ type SystemInfo struct {
 type SessionLog struct {
 	SessionID    string        `yaml:"session"`
 	Timestamp    time.Time     `yaml:"timestamp"`
+	State        string        `yaml:"state"`
 	Pipeline     PipelineInfo  `yaml:"pipeline"`
-	TestResults  []TestResult  `yaml:"test_results"` // Перенесено выше
+	TestResults  []TestResult  `yaml:"test_results"`
 	FlashResults []FlashResult `yaml:"flash_results,omitempty"`
-	System       SystemInfo    `yaml:"system"` // Перенесено ниже тестов
+	System       SystemInfo    `yaml:"system"`
 }
 
 type PipelineInfo struct {
@@ -694,6 +695,12 @@ func runTest(test TestSpec, outputMgr *OutputManager, globalTimeout string) Test
 		action := askUserAction(test.Name)
 		switch action {
 		case "RETRY":
+			// Показываем вывод предыдущего неудачного теста перед повтором
+			if result.Output != "" {
+				fmt.Printf("%sPrevious test output:%s\n", ColorYellow, ColorReset)
+				outputMgr.PrintSection(test.Name+" Previous Output", result.Output)
+			}
+
 			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts+1, ColorReset)
 			continue
 		case "SKIP":
@@ -799,6 +806,13 @@ func handleFailedTestWithRetries(test TestSpec, initialResult TestResult, output
 		switch action {
 		case "RETRY":
 			attempts++
+
+			// Показываем вывод предыдущего неудачного теста перед повтором
+			if currentResult.Output != "" {
+				fmt.Printf("%sPrevious test output:%s\n", ColorYellow, ColorReset)
+				outputMgr.PrintSection(test.Name+" Previous Output", currentResult.Output)
+			}
+
 			fmt.Printf("%sRetrying test '%s' (attempt %d)...%s\n\n", ColorBlue, test.Name, attempts, ColorReset)
 			outputMgr.PrintResult(time.Now(), test.Name, "RUNNING", 0, "")
 			result, output := executeTest(test, globalTimeout)
@@ -2347,43 +2361,6 @@ func testServerConnection(config LogConfig) error {
 	return nil
 }
 
-func saveLog(log SessionLog, config LogConfig) error {
-	if !config.SaveLocal {
-		return nil
-	}
-
-	logDir := config.LogDir
-	if logDir == "" {
-		logDir = "logs"
-	}
-
-	// Create log directory
-	err := os.MkdirAll(logDir, 0755)
-	if err != nil {
-		return fmt.Errorf("failed to create log directory: %v", err)
-	}
-
-	// Generate filename
-	timestamp := log.Timestamp.Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp)
-	filepath := filepath.Join(logDir, filename)
-
-	// Marshal to YAML
-	data, err := yaml.Marshal(log)
-	if err != nil {
-		return fmt.Errorf("failed to marshal log: %v", err)
-	}
-
-	// Write to file
-	err = os.WriteFile(filepath, data, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write log file: %v", err)
-	}
-
-	printSuccess(fmt.Sprintf("Log saved: %s", filepath))
-	return nil
-}
-
 func sendLogToServer(log SessionLog, config LogConfig) error {
 	if !config.SendLogs || config.Server == "" {
 		return nil
@@ -2411,9 +2388,9 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 	}
 	tmpFile.Close()
 
-	// Generate remote filename and path
+	// Generate remote filename with state
 	timestamp := log.Timestamp.Format("20060102_150405")
-	remoteFile := fmt.Sprintf("%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp)
+	remoteFile := fmt.Sprintf("%s_%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp, log.State)
 
 	// Build remote directory path
 	remoteDirParts := []string{}
@@ -2444,39 +2421,35 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 	host := serverParts[1]
 	serverAddr := fmt.Sprintf("%s@%s", user, host)
 
-	fmt.Printf("Remote directory: %s/%s\n", serverAddr, remoteDir)
-	fmt.Printf("Remote file: %s\n", remoteFile)
+	fmt.Printf("Remote: %s:%s/%s\n", serverAddr, remoteDir, remoteFile)
 
 	// Step 1: Create remote directories if they don't exist
 	if remoteDir != "." {
-		createDirCmd := exec.Command("ssh",
+		createCmd := fmt.Sprintf("mkdir -p \"%s\"", remoteDir)
+		cmd := exec.Command("ssh",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
 			"-o", "ConnectTimeout=10",
-			serverAddr,
-			fmt.Sprintf("mkdir -p '%s'", remoteDir))
-
-		fmt.Printf("Creating remote directory: %s\n", remoteDir)
-		if output, err := createDirCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to create remote directory: %v\nOutput: %s", err, string(output))
+			serverAddr, createCmd)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to create remote directory: %v", err)
 		}
 	}
 
-	// Step 2: Send file via SCP
-	fullRemotePath := fmt.Sprintf("%s:%s/%s", serverAddr, remoteDir, remoteFile)
-	scpCmd := exec.Command("scp",
+	// Step 2: Upload file
+	remoteFullPath := fmt.Sprintf("%s/%s", remoteDir, remoteFile)
+	scpTarget := fmt.Sprintf("%s:%s", serverAddr, remoteFullPath)
+
+	cmd := exec.Command("scp",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
-		tmpFile.Name(),
-		fullRemotePath)
-
-	fmt.Printf("Uploading file to: %s\n", fullRemotePath)
-	if output, err := scpCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to send log via SCP: %v\nOutput: %s\nCommand: %s", err, string(output), scpCmd.String())
+		tmpFile.Name(), scpTarget)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to upload file: %v\nOutput: %s", err, string(output))
 	}
 
-	printSuccess("Log sent to server successfully")
+	printSuccess("Log successfully sent to server")
 	return nil
 }
 
@@ -3249,6 +3222,62 @@ func setOneTimeBoot(targetDevice, targetEfi string) error {
 	return fmt.Errorf("failed to verify BootNext setting for Boot%s", bootNum)
 }
 
+// calculateSessionState определяет общий статус сессии на основе результатов тестов и прошивки
+func calculateSessionState(testResults []TestResult, flashResults []FlashResult) string {
+	// Проверяем критические тесты
+	for _, result := range testResults {
+		if result.Required && (result.Status == "FAILED" || result.Status == "TIMEOUT") {
+			return "failed"
+		}
+	}
+
+	// Проверяем результаты прошивки
+	for _, flashResult := range flashResults {
+		if flashResult.Status == "FAILED" {
+			return "failed"
+		}
+	}
+
+	return "pass"
+}
+
+func saveLog(log SessionLog, config LogConfig) error {
+	if !config.SaveLocal {
+		return nil
+	}
+
+	logDir := config.LogDir
+	if logDir == "" {
+		logDir = "logs"
+	}
+
+	// Create log directory
+	err := os.MkdirAll(logDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create log directory: %v", err)
+	}
+
+	// Generate filename with state
+	timestamp := log.Timestamp.Format("20060102_150405")
+	filename := fmt.Sprintf("%s_%s_%s_%s.yaml", log.System.Product, log.System.MBSerial, timestamp, log.State)
+	filepath := filepath.Join(logDir, filename)
+
+	// Marshal to YAML
+	data, err := yaml.Marshal(log)
+	if err != nil {
+		return fmt.Errorf("failed to marshal log: %v", err)
+	}
+
+	// Write to file
+	err = os.WriteFile(filepath, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write log file: %v", err)
+	}
+
+	printSuccess(fmt.Sprintf("Log saved: %s", filepath))
+	return nil
+}
+
 func main() {
 	var configPath string
 	var showVersion bool
@@ -3418,10 +3447,14 @@ func main() {
 	// Session duration
 	totalDuration := time.Since(sessionStart)
 
+	// Вычисляем общий статус сессии
+	sessionState := calculateSessionState(allResults, flashResults)
+
 	// Save & send logs
 	sessionLog := SessionLog{
 		SessionID:    fmt.Sprintf("%d", time.Now().Unix()),
 		Timestamp:    sessionStart,
+		State:        sessionState,
 		Pipeline:     PipelineInfo{Mode: "full", Config: configPath, Duration: totalDuration, Operator: config.Log.OpName},
 		TestResults:  allResults, // Перенесено выше системной информации
 		FlashResults: flashResults,
