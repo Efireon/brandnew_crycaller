@@ -2130,11 +2130,12 @@ func restoreIPAddress(interfaceName, ipAddress string) error {
 	return nil
 }
 
-func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemConfig) []FlashResult {
+func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemConfig) ([]FlashResult, bool) {
 	var results []FlashResult
+	var serialNumberChanged bool = false
 
 	if !config.Enabled {
-		return results
+		return results, false
 	}
 
 	fmt.Println(strings.Repeat("-", 80))
@@ -2170,7 +2171,7 @@ func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemCo
 
 		case "efi":
 			printInfo("Updating EFI variables")
-			efiChanged, err := updateEFIVariables(systemConfig, flashData)
+			efiChanged, efiSerialChanged, err := updateEFIVariables(systemConfig, flashData)
 			if err != nil {
 				result.Status = "FAILED"
 				result.Details = fmt.Sprintf("EFI update failed: %v", err)
@@ -2179,15 +2180,23 @@ func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemCo
 				result.Details = "All EFI variables already have correct values"
 			}
 
+			if efiSerialChanged {
+				serialNumberChanged = true
+			}
+
 		case "fru":
 			printInfo("Flashing FRU chip...")
 			if flashData.SystemSerial != "" {
-				err := flashFRU(systemConfig, flashData.SystemSerial)
+				fruSerialChanged, err := flashFRU(systemConfig, flashData.SystemSerial)
 				if err != nil {
 					result.Status = "FAILED"
 					result.Details = fmt.Sprintf("FRU flash failed: %v", err)
+				} else if !fruSerialChanged {
+					result.Status = "SKIPPED"
+					result.Details = "FRU already contains target serial number"
 				} else {
 					printSuccess("FRU chip flashed successfully")
+					serialNumberChanged = true
 				}
 			} else {
 				result.Status = "FAILED"
@@ -2201,7 +2210,7 @@ func runFlashing(config FlashConfig, flashData *FlashData, systemConfig SystemCo
 		outputManager.PrintResult(time.Now(), operation, result.Status, result.Duration, result.Details)
 	}
 
-	return results
+	return results, serialNumberChanged
 }
 
 func validateEFISystem() error {
@@ -2292,76 +2301,6 @@ func setEFIVariable(guidPrefix, varName, value string) error {
 	}
 
 	return nil
-}
-
-func updateEFIVariables(config SystemConfig, flashData *FlashData) (bool, error) {
-	printInfo("Updating EFI variables...")
-
-	// Validate EFI system before proceeding
-	if err := validateEFISystem(); err != nil {
-		return false, fmt.Errorf("EFI system validation failed: %v", err)
-	}
-
-	anyChanges := false
-
-	// Update system serial number EFI variable
-	if flashData.SystemSerial != "" && config.EfiSnName != "" {
-		// Проверяем существующее значение
-		existingSerial, err := getEFIVariable(config.GuidPrefix, config.EfiSnName)
-		if err == nil && existingSerial == flashData.SystemSerial {
-			printInfo(fmt.Sprintf("EFI variable %s already contains target value: %s - skipping",
-				config.EfiSnName, flashData.SystemSerial))
-		} else {
-			if err == nil {
-				printInfo(fmt.Sprintf("EFI variable %s current value: %s, updating to: %s",
-					config.EfiSnName, existingSerial, flashData.SystemSerial))
-			} else {
-				printInfo(fmt.Sprintf("EFI variable %s does not exist, creating with value: %s",
-					config.EfiSnName, flashData.SystemSerial))
-			}
-
-			err := setEFIVariable(config.GuidPrefix, config.EfiSnName, flashData.SystemSerial)
-			if err != nil {
-				return false, fmt.Errorf("failed to set serial EFI variable: %v", err)
-			}
-			anyChanges = true
-		}
-	}
-
-	// Update MAC address EFI variable
-	if flashData.MAC != "" && config.EfiMacName != "" {
-		// Convert MAC to the format expected by EFI (remove colons, uppercase)
-		hexMAC := strings.ReplaceAll(strings.ToUpper(flashData.MAC), ":", "")
-
-		// Проверяем существующее значение
-		existingMAC, err := getEFIVariable(config.GuidPrefix, config.EfiMacName)
-		if err == nil && existingMAC == hexMAC {
-			printInfo(fmt.Sprintf("EFI variable %s already contains target value: %s (MAC: %s) - skipping",
-				config.EfiMacName, hexMAC, flashData.MAC))
-		} else {
-			if err == nil {
-				printInfo(fmt.Sprintf("EFI variable %s current value: %s, updating to: %s (MAC: %s)",
-					config.EfiMacName, existingMAC, hexMAC, flashData.MAC))
-			} else {
-				printInfo(fmt.Sprintf("EFI variable %s does not exist, creating with value: %s (MAC: %s)",
-					config.EfiMacName, hexMAC, flashData.MAC))
-			}
-
-			err := setEFIVariable(config.GuidPrefix, config.EfiMacName, hexMAC)
-			if err != nil {
-				return false, fmt.Errorf("failed to set MAC EFI variable: %v", err)
-			}
-			anyChanges = true
-		}
-	}
-
-	if anyChanges {
-		printSuccess("EFI variables updated successfully")
-	} else {
-		printSuccess("All EFI variables already have correct values - no changes needed")
-	}
-
-	return anyChanges, nil
 }
 
 func testServerConnection(config LogConfig) error {
@@ -2488,6 +2427,34 @@ func sendLogToServer(log SessionLog, config LogConfig) error {
 
 	printSuccess("Log successfully sent to server")
 	return nil
+}
+
+// getCurrentFRUSerial читает текущий серийный номер из FRU чипа
+func getCurrentFRUSerial() (string, error) {
+	cmd := exec.Command("ipmitool", "fru", "print", "0")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Board Serial") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				serial := strings.TrimSpace(parts[1])
+				if serial == "" || serial == "Not Specified" || serial == "Unknown" {
+					return "", fmt.Errorf("no valid serial number found in FRU")
+				}
+				return serial, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("Board Serial field not found in FRU data")
 }
 
 func checkFRUStatus() (*FRUStatus, error) {
@@ -2767,18 +2734,93 @@ func askFRURetryAction(message string) string {
 	}
 }
 
-func flashFRU(systemConfig SystemConfig, serialNumber string) error {
-	// Проверяем существующий серийный номер в системе
-	currentSerial, err := getCurrentSystemSerial()
+// Модифицированная функция updateEFIVariables с возвращением информации об изменениях серийного номера
+func updateEFIVariables(config SystemConfig, flashData *FlashData) (bool, bool, error) {
+	printInfo("Updating EFI variables...")
+
+	// Validate EFI system before proceeding
+	if err := validateEFISystem(); err != nil {
+		return false, false, fmt.Errorf("EFI system validation failed: %v", err)
+	}
+
+	anyChanges := false
+	serialChanged := false
+
+	// Update system serial number EFI variable
+	if flashData.SystemSerial != "" && config.EfiSnName != "" {
+		// Проверяем существующее значение
+		existingSerial, err := getEFIVariable(config.GuidPrefix, config.EfiSnName)
+		if err == nil && existingSerial == flashData.SystemSerial {
+			printInfo(fmt.Sprintf("EFI variable %s already contains target value: %s - skipping",
+				config.EfiSnName, flashData.SystemSerial))
+		} else {
+			if err == nil {
+				printInfo(fmt.Sprintf("EFI variable %s current value: %s, updating to: %s",
+					config.EfiSnName, existingSerial, flashData.SystemSerial))
+			} else {
+				printInfo(fmt.Sprintf("EFI variable %s does not exist, creating with value: %s",
+					config.EfiSnName, flashData.SystemSerial))
+			}
+
+			err := setEFIVariable(config.GuidPrefix, config.EfiSnName, flashData.SystemSerial)
+			if err != nil {
+				return false, false, fmt.Errorf("failed to set serial EFI variable: %v", err)
+			}
+			anyChanges = true
+			serialChanged = true // Серийный номер изменился!
+		}
+	}
+
+	// Update MAC address EFI variable
+	if flashData.MAC != "" && config.EfiMacName != "" {
+		// Convert MAC to the format expected by EFI (remove colons, uppercase)
+		hexMAC := strings.ReplaceAll(strings.ToUpper(flashData.MAC), ":", "")
+
+		// Проверяем существующее значение
+		existingMAC, err := getEFIVariable(config.GuidPrefix, config.EfiMacName)
+		if err == nil && existingMAC == hexMAC {
+			printInfo(fmt.Sprintf("EFI variable %s already contains target value: %s (MAC: %s) - skipping",
+				config.EfiMacName, hexMAC, flashData.MAC))
+		} else {
+			if err == nil {
+				printInfo(fmt.Sprintf("EFI variable %s current value: %s, updating to: %s (MAC: %s)",
+					config.EfiMacName, existingMAC, hexMAC, flashData.MAC))
+			} else {
+				printInfo(fmt.Sprintf("EFI variable %s does not exist, creating with value: %s (MAC: %s)",
+					config.EfiMacName, hexMAC, flashData.MAC))
+			}
+
+			err := setEFIVariable(config.GuidPrefix, config.EfiMacName, hexMAC)
+			if err != nil {
+				return false, false, fmt.Errorf("failed to set MAC EFI variable: %v", err)
+			}
+			anyChanges = true
+			// MAC не требует перезагрузки, serialChanged остается прежним
+		}
+	}
+
+	if anyChanges {
+		printSuccess("EFI variables updated successfully")
+	} else {
+		printSuccess("All EFI variables already have correct values - no changes needed")
+	}
+
+	return anyChanges, serialChanged, nil
+}
+
+// Модифицированная функция flashFRU с возвращением информации об изменении серийного номера
+func flashFRU(systemConfig SystemConfig, serialNumber string) (bool, error) {
+	// Проверяем существующий серийный номер в FRU (НЕ в dmidecode!)
+	currentSerial, err := getCurrentFRUSerial()
 	if err == nil && currentSerial == serialNumber {
-		printInfo(fmt.Sprintf("System already contains target serial number: %s - skipping FRU flashing", serialNumber))
-		return nil
+		printInfo(fmt.Sprintf("FRU already contains target serial number: %s - skipping FRU flashing", serialNumber))
+		return false, nil // Серийный номер не изменился
 	}
 
 	if err == nil {
-		printInfo(fmt.Sprintf("Current system serial: %s, updating to: %s", currentSerial, serialNumber))
+		printInfo(fmt.Sprintf("Current FRU serial: %s, updating to: %s", currentSerial, serialNumber))
 	} else {
-		printInfo(fmt.Sprintf("Could not read current system serial (%v), proceeding with FRU flash to: %s", err, serialNumber))
+		printInfo(fmt.Sprintf("Could not read current FRU serial (%v), proceeding with FRU flash to: %s", err, serialNumber))
 	}
 
 	printSubHeader("FRU CHIP FLASHING", fmt.Sprintf("Target Serial: %s | Manufacturer: %s", serialNumber, systemConfig.Manufacturer))
@@ -2786,7 +2828,7 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 	// Step 1: Check current FRU status
 	status, err := checkFRUStatus()
 	if err != nil {
-		return fmt.Errorf("failed to check FRU status: %v", err)
+		return false, fmt.Errorf("failed to check FRU status: %v", err)
 	}
 
 	// Step 2: If FRU has bad checksum or is empty, flash blank first
@@ -2805,13 +2847,13 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 
 		blankFile, err := createFRUBlankFile()
 		if err != nil {
-			return fmt.Errorf("failed to create blank FRU file: %v", err)
+			return false, fmt.Errorf("failed to create blank FRU file: %v", err)
 		}
 		defer os.Remove(blankFile)
 
 		printInfo("Flashing 2048-byte null file to clear FRU...")
 		if err := flashFRUFile(blankFile); err != nil {
-			return fmt.Errorf("failed to flash blank FRU: %v", err)
+			return false, fmt.Errorf("failed to flash blank FRU: %v", err)
 		}
 
 		printSuccess("Blank FRU flash completed")
@@ -2819,17 +2861,6 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 		// Wait for FRU to be ready after blank flash
 		printInfo("Waiting for FRU to stabilize...")
 		time.Sleep(3 * time.Second)
-
-		// Verify blank flash worked by trying to read FRU again
-		printInfo("Verifying blank flash...")
-		newStatus, err := checkFRUStatus()
-		if err == nil && newStatus.CanRead {
-			printSuccess("FRU is now ready for data programming")
-		} else {
-			printWarning("FRU still has issues after blank flash, but continuing...")
-		}
-	} else {
-		printInfo("FRU is readable and has valid data - skipping blank flash")
 	}
 
 	// Step 3: Generate and flash FRU with retries
@@ -2861,7 +2892,7 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 				} else {
 					// Success!
 					printSuccess("FRU flashing completed successfully")
-					return nil
+					return true, nil // Серийный номер был изменен!
 				}
 			}
 		}
@@ -2872,9 +2903,9 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 			switch action {
 			case "SKIP":
 				printWarning("FRU flashing skipped by operator")
-				return nil
+				return false, nil
 			case "ABORT":
-				return fmt.Errorf("FRU flashing aborted by operator")
+				return false, fmt.Errorf("FRU flashing aborted by operator")
 			case "RETRY":
 				printInfo("Retrying FRU flashing...")
 				continue
@@ -2883,7 +2914,7 @@ func flashFRU(systemConfig SystemConfig, serialNumber string) error {
 	}
 
 	// All attempts failed
-	return fmt.Errorf("FRU flashing failed after %d attempts: %v", maxAttempts, lastError)
+	return false, fmt.Errorf("FRU flashing failed after %d attempts: %v", maxAttempts, lastError)
 }
 
 func findBootDevice() (string, error) {
@@ -3097,22 +3128,6 @@ func getEFIVariable(guidPrefix, varName string) (string, error) {
 
 	readData := readBuf[:n]
 	return string(readData), nil
-}
-
-// getCurrentSystemSerial получает текущий серийный номер из dmidecode
-func getCurrentSystemSerial() (string, error) {
-	cmd := exec.Command("dmidecode", "-s", "baseboard-serial-number")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-
-	serial := strings.TrimSpace(string(output))
-	if serial == "" || serial == "Not Specified" || serial == "Unknown" {
-		return "", fmt.Errorf("no valid serial number found in system")
-	}
-
-	return serial, nil
 }
 
 // bootctl mounts external EFI partition, copies contents of efishell directory (ctefi)
@@ -3525,13 +3540,14 @@ func main() {
 	}
 
 	// FLASHING PHASE [2/2]
+	var serialNumberChanged bool = false
 	if !testsOnly && config.Flash.Enabled && flashData != nil {
 		fmt.Printf("\n%sFLASHING PHASE [2/2]%s\n", ColorWhite, ColorReset)
 		printThickSeparator()
 		fmt.Printf("Operations: %s%s%s | Method: %s%s%s\n",
 			ColorYellow, strings.Join(config.Flash.Operations, ", "), ColorReset,
 			ColorGreen, config.Flash.Method, ColorReset)
-		flashResults = runFlashing(config.Flash, flashData, config.System)
+		flashResults, serialNumberChanged = runFlashing(config.Flash, flashData, config.System)
 	}
 
 	// Session duration
@@ -3607,20 +3623,11 @@ func main() {
 			ColorRed, exitCode, ColorReset)
 	}
 
-	// Проверяем, была ли выполнена операция прошивки EFI
-	efiFlashed := false
-	for _, fr := range flashResults {
-		if fr.Operation == "efi" && fr.Status == "PASSED" {
-			efiFlashed = true
-			break
-		}
-	}
-
 	reader := bufio.NewReader(os.Stdin)
 
-	if efiFlashed {
-		// EFI была прошита - требуется перезагрузка
-		fmt.Printf("\n%sEFI variables were updated. System reboot is required for changes to take effect.%s\n", ColorYellow, ColorReset)
+	if serialNumberChanged {
+		// Серийный номер был изменен - требуется перезагрузка
+		fmt.Printf("\n%sSerial number was updated. System reboot is required for changes to take effect.%s\n", ColorYellow, ColorReset)
 		fmt.Printf("%sDo you want to reboot the system now?%s %s[Y/n]%s: ", ColorWhite, ColorReset, ColorGreen, ColorReset)
 
 		input, err := reader.ReadString('\n')
@@ -3644,11 +3651,11 @@ func main() {
 			}
 		} else {
 			printInfo("Reboot cancelled by user.")
-			printWarning("Note: EFI changes require a reboot to take effect.")
+			printWarning("Note: Serial number changes require a reboot to take effect.")
 		}
 	} else {
-		// EFI не была прошита - можно просто выключить
-		fmt.Printf("\n%sNo EFI changes were made. System can be safely shut down.%s\n", ColorBlue, ColorReset)
+		// Серийный номер не изменялся - можно просто выключить
+		fmt.Printf("\n%sNo serial number changes were made. System can be safely shut down.%s\n", ColorBlue, ColorReset)
 		fmt.Printf("%sDo you want to shutdown the system now?%s %s[Y/n]%s: ", ColorWhite, ColorReset, ColorGreen, ColorReset)
 
 		input, err := reader.ReadString('\n')
