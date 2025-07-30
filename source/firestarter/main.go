@@ -2183,7 +2183,7 @@ func flashMACWithRtnicpg(targetMAC string, interfaces []NetworkInterface, system
 	}
 
 	if summary.Error != "" {
-		return fmt.Errorf(summary.Error)
+		return fmt.Errorf("%s", summary.Error)
 	}
 
 	// Step 6: Verify MAC was flashed
