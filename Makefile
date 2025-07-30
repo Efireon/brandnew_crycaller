@@ -38,5 +38,9 @@ build_power_test:
 	(cd source/power_test && go build -o power_test main.go)
 	mv source/power_test/power_test bin/
 
+build_bmc_test:
+	(cd source/bmc_test && go mod tidy)
+	(cd source/bmc_test && go build -o bmc_test cmd/main.go)
+	mv source/bmc_test/bmc_test bin/	
 
-build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test build_network_test build_power_test
+build_all: build_fan_test build_gpu_test build_cpu_test build_ram_test build_firestarter build_disk_test build_network_test build_power_test build_bmc_test 
