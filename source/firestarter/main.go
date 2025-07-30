@@ -198,6 +198,13 @@ type OutputManager struct {
 	mutex sync.Mutex
 }
 
+// Структура для резервной копии сетевого состояния
+type NetworkBackup struct {
+	Timestamp     time.Time
+	Interfaces    []NetworkInterface
+	LoadedModules []string
+}
+
 // getTerminalWidth получает ширину терминала
 func getTerminalWidth() int {
 	// Попробуем получить через stty
@@ -1857,61 +1864,288 @@ func flashMACWithEeupdate(targetMAC string, interfaces []NetworkInterface, flash
 	return nil
 }
 
-func flashMACWithRtnicpg(targetMAC string, interfaces []NetworkInterface, systemConfig SystemConfig, summary *FlashMACSummary) error {
-	printInfo("Starting rtnicpg MAC flashing process...")
+// Функция для проверки загрузки pgdrv модуля с таймаутом
+func verifyPgdrvLoaded() error {
+	cmd := exec.Command("lsmod")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to run lsmod: %v", err)
+	}
 
-	// Step 1: Find network interface with IP and save current state
-	var primaryInterface *NetworkInterface
-	for i := range interfaces {
-		if interfaces[i].IP != "" && interfaces[i].State == "UP" {
-			primaryInterface = &interfaces[i]
-			break
+	if strings.Contains(string(output), "pgdrv") {
+		return nil
+	}
+
+	return fmt.Errorf("pgdrv module not found in lsmod output")
+}
+
+// Функция ожидания загрузки pgdrv с циклом проверки
+func waitForPgdrvLoad(timeoutSeconds int) error {
+	for i := 0; i < timeoutSeconds*10; i++ { // Проверяем каждые 100мс
+		if err := verifyPgdrvLoaded(); err == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond) // Задержка цикла проверки
+	}
+	return fmt.Errorf("timeout waiting for pgdrv module to load")
+}
+
+// Функция ожидания выгрузки pgdrv с циклом проверки
+func waitForPgdrvUnload(timeoutSeconds int) error {
+	for i := 0; i < timeoutSeconds*10; i++ { // Проверяем каждые 100мс
+		if err := verifyPgdrvLoaded(); err != nil {
+			return nil // Модуль не найден = выгружен
+		}
+		time.Sleep(100 * time.Millisecond) // Задержка цикла проверки
+	}
+	return fmt.Errorf("timeout waiting for pgdrv module to unload")
+}
+
+// Функция для загрузки rtnicpg драйвера из файла
+func loadRtnicpgDriverFromPath(driverPath string) error {
+	printInfo(fmt.Sprintf("Loading rtnicpg driver from: %s", driverPath))
+
+	// Проверяем существование файла
+	if _, err := os.Stat(driverPath); os.IsNotExist(err) {
+		return fmt.Errorf("driver file not found: %s", driverPath)
+	}
+
+	// Загружаем драйвер
+	cmd := exec.Command("insmod", driverPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("insmod failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Ждем загрузки pgdrv модуля с таймаутом
+	if err := waitForPgdrvLoad(5); err != nil {
+		return fmt.Errorf("pgdrv driver verification failed: %v", err)
+	}
+
+	printSuccess("pgdrv driver loaded and verified successfully")
+	return nil
+}
+
+// Функция для выгрузки pgdrv модуля
+func unloadPgdrvDriver() error {
+	printInfo("Unloading pgdrv module")
+
+	// Проверяем, загружен ли pgdrv
+	if err := verifyPgdrvLoaded(); err != nil {
+		printInfo("pgdrv module not loaded, nothing to unload")
+		return nil
+	}
+
+	// Выгружаем модуль pgdrv
+	cmd := exec.Command("rmmod", "pgdrv")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Если не получилось, попробуем форсированно
+		printWarning(fmt.Sprintf("Normal rmmod failed, trying force: %v", err))
+		cmd = exec.Command("rmmod", "-f", "pgdrv")
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("rmmod pgdrv failed: %v\nOutput: %s", err, string(output))
 		}
 	}
 
+	// Ждем выгрузки модуля с таймаутом
+	if err := waitForPgdrvUnload(3); err != nil {
+		printWarning("pgdrv module still appears loaded after rmmod")
+	} else {
+		printSuccess("pgdrv module unloaded successfully")
+	}
+
+	return nil
+}
+
+// Функция ожидания загрузки сетевого драйвера
+func waitForDriverLoad(driverName string, timeoutSeconds int) error {
+	for i := 0; i < timeoutSeconds*10; i++ { // Проверяем каждые 100мс
+		cmd := exec.Command("lsmod")
+		output, err := cmd.Output()
+		if err == nil && strings.Contains(string(output), driverName) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond) // Задержка цикла проверки
+	}
+	return fmt.Errorf("timeout waiting for driver %s to load", driverName)
+}
+
+// Функция для проверки первоначального состояния драйверов
+func checkInitialDriverState(primaryInterface *NetworkInterface) (pgdrvLoaded bool, realtekActive bool) {
+	// Проверяем загружен ли pgdrv
+	pgdrvLoaded = (verifyPgdrvLoaded() == nil)
+
+	// Проверяем активен ли Realtek драйвер
+	realtekActive = false
+	if primaryInterface != nil && primaryInterface.Driver != "" && isRealtekDriver(primaryInterface.Driver) {
+		cmd := exec.Command("lsmod")
+		if output, err := cmd.Output(); err == nil {
+			realtekActive = strings.Contains(string(output), primaryInterface.Driver)
+		}
+	}
+
+	return pgdrvLoaded, realtekActive
+}
+
+// Заменяем функцию loadFlashingDriver на версию без хардкодных sleep'ов
+func loadFlashingDriver(driverDir, originalDriver string) (string, error) {
+	printInfo(fmt.Sprintf("Loading flashing driver for: %s", originalDriver))
+
+	// Получаем версию ядра
+	kernelVersion, err := getKernelVersion()
+	if err != nil {
+		return "", fmt.Errorf("failed to get kernel version: %v", err)
+	}
+
+	// Step 1: Проверяем наличие готового скомпилированного драйвера
+	compiledDriverPath, found := checkCompiledDriver(driverDir, originalDriver, kernelVersion)
+	if found {
+		printInfo("Attempting to use pre-compiled rtnicpg driver...")
+		if err := loadRtnicpgDriverFromPath(compiledDriverPath); err == nil {
+			printSuccess("Pre-compiled pgdrv driver loaded successfully")
+			return compiledDriverPath, nil
+		} else {
+			printWarning(fmt.Sprintf("Pre-compiled driver failed to load: %v", err))
+			printInfo("Will attempt to recompile driver...")
+
+			// Убираем возможно частично загруженный модуль
+			unloadPgdrvDriver()
+		}
+	}
+
+	// Step 2: Компилируем новый драйвер
+	printInfo("Compiling new rtnicpg driver...")
+	compiledPath, err := compileFlashingDriver(driverDir, originalDriver)
+	if err != nil {
+		return "", fmt.Errorf("failed to compile driver: %v", err)
+	}
+
+	// Step 3: Загружаем новый драйвер
+	if err := loadRtnicpgDriverFromPath(compiledPath); err != nil {
+		return "", fmt.Errorf("failed to load compiled pgdrv driver: %v", err)
+	}
+
+	printSuccess("rtnicpg driver compiled and pgdrv module loaded successfully")
+	return compiledPath, nil
+}
+
+// Модифицированная функция flashMACWithRtnicpg для работы с Realtek драйверами
+func flashMACWithRtnicpg(targetMAC string, interfaces []NetworkInterface, systemConfig SystemConfig, summary *FlashMACSummary) error {
+	printInfo("Starting rtnicpg MAC flashing process with Realtek driver detection...")
+
+	// Диагностика интерфейсов для отладки
+	debugNetworkInterfaces(interfaces)
+	debugLoadedModules()
+
+	// Step 1: Сначала попытаемся найти Realtek интерфейс
+	primaryInterface := findRealtekInterface(interfaces)
+
+	// Step 1.1: Если Realtek не найден, используем fallback на старую логику
 	if primaryInterface == nil {
-		return fmt.Errorf("no active network interface with IP found")
+		printWarning("No Realtek network interface found, using fallback to any active interface...")
+		printInfo("Available interfaces:")
+		for _, iface := range interfaces {
+			if iface.Name != "lo" {
+				driverType := "UNKNOWN"
+				if iface.Driver != "" {
+					if isRealtekDriver(iface.Driver) {
+						driverType = "REALTEK"
+					} else if strings.Contains(strings.ToLower(iface.Driver), "intel") ||
+						iface.Driver == "igb" || iface.Driver == "e1000e" ||
+						iface.Driver == "ixgbe" || iface.Driver == "i40e" || iface.Driver == "ice" {
+						driverType = "INTEL"
+					} else {
+						driverType = "OTHER"
+					}
+				}
+				printInfo(fmt.Sprintf("  [%s] %s: MAC=%s Driver=%s State=%s IP=%s",
+					driverType, iface.Name, iface.MAC, iface.Driver, iface.State, iface.IP))
+			}
+		}
+
+		// Fallback: ищем любой активный интерфейс с IP (как в оригинальном коде)
+		for i := range interfaces {
+			if interfaces[i].IP != "" && interfaces[i].State == "UP" {
+				primaryInterface = &interfaces[i]
+				printWarning(fmt.Sprintf("Using fallback interface %s (Driver: %s) - rtnicpg may work with non-Realtek drivers",
+					interfaces[i].Name, interfaces[i].Driver))
+				break
+			}
+		}
+
+		if primaryInterface == nil {
+			return fmt.Errorf("no active network interface with IP found")
+		}
 	}
 
 	summary.OriginalIP = primaryInterface.IP
 	summary.OriginalDriver = primaryInterface.Driver
 
-	printInfo(fmt.Sprintf("Using interface %s (IP: %s, Driver: %s)",
-		primaryInterface.Name, primaryInterface.IP, primaryInterface.Driver))
+	printInfo(fmt.Sprintf("Using interface %s (IP: %s, Driver: %s, State: %s)",
+		primaryInterface.Name, primaryInterface.IP, primaryInterface.Driver, primaryInterface.State))
 
-	// Step 2: Unload current driver
-	printInfo(fmt.Sprintf("Unloading network driver: %s", primaryInterface.Driver))
-	if err := unloadNetworkDriver(primaryInterface.Driver); err != nil {
-		return fmt.Errorf("failed to unload driver %s: %v", primaryInterface.Driver, err)
+	// Step 2: Если интерфейс неактивен, попытаемся его поднять (но не будем ждать)
+	if primaryInterface.State != "UP" {
+		printInfo(fmt.Sprintf("Interface %s is DOWN, attempting to bring it UP...", primaryInterface.Name))
+		cmd := exec.Command("ip", "link", "set", primaryInterface.Name, "up")
+		if err := cmd.Run(); err != nil {
+			printWarning(fmt.Sprintf("Failed to bring interface UP: %v", err))
+		} else {
+			printInfo(fmt.Sprintf("Interface %s UP command sent (not waiting for activation)", primaryInterface.Name))
+		}
 	}
 
-	// Step 3: Load flashing driver
-	driverPath, err := loadFlashingDriver(systemConfig.DriverDir, primaryInterface.Driver)
+	// Step 3: Подготовка pgdrv драйвера с проверкой начального состояния
+	driverPath, err := preparePgdrvDriver(systemConfig.DriverDir, primaryInterface.Driver, primaryInterface)
 	if err != nil {
-		// Try to restore original driver
-		loadNetworkDriver(primaryInterface.Driver)
-		return fmt.Errorf("failed to load flashing driver: %v", err)
+		// Try to restore original driver if preparation failed
+		printWarning("Failed to prepare pgdrv driver, attempting to restore original...")
+		if restoreErr := loadNetworkDriver(primaryInterface.Driver); restoreErr != nil {
+			printError(fmt.Sprintf("Failed to restore original driver: %v", restoreErr))
+		}
+		return fmt.Errorf("failed to prepare pgdrv driver: %v", err)
 	}
+
+	// Step 3.1: Verify pgdrv is loaded
+	if err := verifyPgdrvLoaded(); err != nil {
+		// Try to restore original driver
+		printError("pgdrv module not found after preparation, restoring original driver...")
+		loadNetworkDriver(primaryInterface.Driver)
+		return fmt.Errorf("pgdrv module verification failed: %v", err)
+	}
+	printSuccess("pgdrv module confirmed loaded and ready for flashing")
 
 	// Step 4: Flash MAC using rtnic
 	attempts := 0
 	maxAttempts := 3
+	var flashErr error
 
 	for attempts < maxAttempts {
 		attempts++
-		printInfo(fmt.Sprintf("Flashing MAC attempt %d/%d...", attempts, maxAttempts))
+		printInfo(fmt.Sprintf("Flashing MAC attempt %d/%d using rtnic (pgdrv loaded)...", attempts, maxAttempts))
 
-		err = executeRtnicFlashing(targetMAC)
-		if err == nil {
+		flashErr = executeRtnicFlashing(targetMAC)
+		if flashErr == nil {
+			printSuccess(fmt.Sprintf("rtnic flashing completed successfully on attempt %d", attempts))
 			break
 		}
 
+		printError(fmt.Sprintf("rtnic flashing failed on attempt %d: %v", attempts, flashErr))
+
 		if attempts < maxAttempts {
-			action := askFlashRetryAction(fmt.Sprintf("rtnic flashing failed (attempt %d): %v", attempts, err))
+			action := askFlashRetryAction(fmt.Sprintf("rtnic flashing failed (attempt %d): %v", attempts, flashErr))
 			if action == "SKIP" {
 				summary.Success = false
 				summary.Error = "Skipped by operator"
-				return nil
+				break
+			}
+			if action == "ABORT" {
+				summary.Success = false
+				summary.Error = "Aborted by operator"
+				flashErr = fmt.Errorf("flashing aborted by operator")
+				break
 			}
 			if action != "RETRY" {
 				break
@@ -1919,48 +2153,332 @@ func flashMACWithRtnicpg(targetMAC string, interfaces []NetworkInterface, system
 		}
 	}
 
-	// Step 5: Unload flashing driver and restore original
-	unloadNetworkDriver(filepath.Base(driverPath))
-	if err := loadNetworkDriver(primaryInterface.Driver); err != nil {
-		printError(fmt.Sprintf("Warning: failed to restore original driver %s: %v", primaryInterface.Driver, err))
+	// Step 5: Cleanup - unload pgdrv module and restore original driver
+	printInfo("Cleaning up: unloading pgdrv and restoring original driver...")
+
+	// Выгружаем pgdrv модуль (если он не был предзагружен)
+	if driverPath != "pgdrv_already_loaded" {
+		if err := unloadPgdrvDriver(); err != nil {
+			printError(fmt.Sprintf("Warning: failed to unload pgdrv module: %v", err))
+		}
+
+		// Восстанавливаем оригинальный драйвер
+		if err := loadNetworkDriver(primaryInterface.Driver); err != nil {
+			printError(fmt.Sprintf("Warning: failed to restore original driver %s: %v", primaryInterface.Driver, err))
+		} else {
+			printSuccess(fmt.Sprintf("Original driver %s restored successfully", primaryInterface.Driver))
+		}
+	} else {
+		printInfo("pgdrv was pre-loaded, leaving it active (not restoring original driver)")
 	}
 
-	if err != nil && attempts >= maxAttempts {
+	// Step 5.1: Verify cleanup state
+	debugLoadedModules()
+
+	// Проверяем результат флэширования
+	if flashErr != nil && attempts >= maxAttempts {
 		summary.Success = false
-		summary.Error = fmt.Sprintf("Max attempts reached: %v", err)
-		return err
+		summary.Error = fmt.Sprintf("Max attempts reached: %v", flashErr)
+		return flashErr
+	}
+
+	if summary.Error != "" {
+		return fmt.Errorf(summary.Error)
 	}
 
 	// Step 6: Verify MAC was flashed
-	time.Sleep(2 * time.Second) // Wait for interfaces to come up
+	printInfo("Verifying MAC address after flashing...")
+
 	newInterfaces, err := getCurrentNetworkInterfaces()
 	if err != nil {
 		printError(fmt.Sprintf("Warning: failed to verify MAC flashing: %v", err))
-	} else {
-		exists, interfaceName := isTargetMACPresent(targetMAC, newInterfaces)
-		if exists {
-			summary.Success = true
-			summary.InterfaceName = interfaceName
-			printSuccess(fmt.Sprintf("MAC %s found on interface %s", targetMAC, interfaceName))
+		summary.Success = false
+		summary.Error = "Failed to verify flashing result"
+		return fmt.Errorf("failed to verify MAC flashing: %v", err)
+	}
 
-			// Try to restore IP address
+	// Проверяем наличие целевого MAC адреса
+	exists, interfaceName := isTargetMACPresent(targetMAC, newInterfaces)
+	if exists {
+		summary.Success = true
+		summary.InterfaceName = interfaceName
+		printSuccess(fmt.Sprintf("SUCCESS: MAC %s found on interface %s", targetMAC, interfaceName))
+
+		// Попытаемся восстановить IP адрес, если он был
+		if summary.OriginalIP != "" {
+			printInfo(fmt.Sprintf("Attempting to restore original IP address: %s", summary.OriginalIP))
 			if err := restoreIPAddress(interfaceName, summary.OriginalIP); err != nil {
-				printError(fmt.Sprintf("Warning: failed to restore IP %s: %v", summary.OriginalIP, err))
+				printWarning(fmt.Sprintf("Failed to restore IP %s: %v", summary.OriginalIP, err))
+			} else {
+				printSuccess(fmt.Sprintf("IP address %s restored successfully", summary.OriginalIP))
 			}
-		} else {
-			action := askFlashRetryAction("Flashing completed but target MAC not found on any interface")
-			if action == "SKIP" {
-				summary.Success = false
-				summary.Error = "MAC not found after flashing - skipped by operator"
-				return nil
-			}
-			summary.Success = false
-			summary.Error = "MAC not found after flashing"
-			return fmt.Errorf("target MAC not found after flashing")
 		}
+
+		// Проверяем, что интерфейс активен
+		for _, iface := range newInterfaces {
+			if iface.Name == interfaceName {
+				if iface.State != "UP" {
+					printInfo(fmt.Sprintf("Bringing interface %s UP...", interfaceName))
+					cmd := exec.Command("ip", "link", "set", interfaceName, "up")
+					cmd.Run()
+				}
+				break
+			}
+		}
+	} else {
+		printError(fmt.Sprintf("FAILURE: Target MAC %s not found on any interface after flashing", targetMAC))
+
+		// Показываем текущие MAC адреса для отладки
+		printInfo("Current MAC addresses after flashing:")
+		for _, iface := range newInterfaces {
+			if iface.MAC != "" && iface.Name != "lo" {
+				driverType := "OTHER"
+				if isRealtekDriver(iface.Driver) {
+					driverType = "REALTEK"
+				}
+				printInfo(fmt.Sprintf("  [%s] %s: %s", driverType, iface.Name, iface.MAC))
+			}
+		}
+
+		action := askFlashRetryAction(fmt.Sprintf("Flashing completed but target MAC %s not found on any interface", targetMAC))
+		if action == "SKIP" {
+			summary.Success = false
+			summary.Error = "MAC not found after flashing - skipped by operator"
+			return nil
+		}
+		if action == "ABORT" {
+			summary.Success = false
+			summary.Error = "MAC not found after flashing - aborted by operator"
+			return fmt.Errorf("MAC not found after flashing - aborted by operator")
+		}
+		summary.Success = false
+		summary.Error = "MAC not found after flashing"
+		return fmt.Errorf("target MAC not found after flashing")
 	}
 
 	return nil
+}
+
+// Диагностическая функция для отладки модулей
+func debugLoadedModules() {
+	printInfo("=== Loaded Network Modules Debug ===")
+
+	cmd := exec.Command("lsmod")
+	output, err := cmd.Output()
+	if err != nil {
+		printError(fmt.Sprintf("Failed to run lsmod: %v", err))
+		return
+	}
+
+	lines := strings.Split(string(output), "\n")
+	printInfo("Network-related modules:")
+
+	pgdrvFound := false
+	for _, line := range lines[1:] { // Skip header
+		if strings.Contains(line, "r8") ||
+			strings.Contains(line, "rtl") ||
+			strings.Contains(line, "8139") ||
+			strings.Contains(line, "igb") ||
+			strings.Contains(line, "e1000") ||
+			strings.Contains(line, "ixgbe") ||
+			strings.Contains(line, "i40e") ||
+			strings.Contains(line, "ice") ||
+			strings.Contains(line, "pgdrv") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				status := ""
+				if parts[0] == "pgdrv" {
+					status = " ← RTNICPG FLASHING DRIVER"
+					pgdrvFound = true
+				}
+				printInfo(fmt.Sprintf("  %s (used by %s, refs: %s)%s", parts[0], parts[2], parts[1], status))
+			}
+		}
+	}
+
+	if pgdrvFound {
+		printSuccess("pgdrv module is currently loaded")
+	} else {
+		printInfo("pgdrv module is not loaded")
+	}
+
+	printInfo("=== End Module Debug ===")
+}
+
+// Функция для генерации имени файла драйвера
+func getDriverFileName(driverName, kernelVersion string) string {
+	return fmt.Sprintf("%s_%s.ko", driverName, kernelVersion)
+}
+
+// Функция для проверки существования скомпилированного драйвера
+func checkCompiledDriver(driverDir, driverName, kernelVersion string) (string, bool) {
+	driverFileName := getDriverFileName(driverName, kernelVersion)
+	driverPath := filepath.Join(driverDir, driverFileName)
+
+	if _, err := os.Stat(driverPath); err == nil {
+		printInfo(fmt.Sprintf("Found compiled driver: %s", driverPath))
+		return driverPath, true
+	}
+
+	return "", false
+}
+
+// Функция для проверки исходников драйвера rtnicpg
+func checkRtnicpgSources(driverDir string) (string, bool) {
+	rtnicpgDir := filepath.Join(driverDir, "rtnicpg")
+	makefilePath := filepath.Join(rtnicpgDir, "Makefile")
+
+	// Проверяем существование папки rtnicpg
+	if _, err := os.Stat(rtnicpgDir); os.IsNotExist(err) {
+		return "", false
+	}
+
+	// Проверяем существование Makefile
+	if _, err := os.Stat(makefilePath); os.IsNotExist(err) {
+		return "", false
+	}
+
+	printInfo(fmt.Sprintf("Found rtnicpg sources: %s", rtnicpgDir))
+	return rtnicpgDir, true
+}
+
+// Функция для проверки требований к сборке
+func checkBuildRequirements() error {
+	printInfo("Checking build requirements...")
+
+	// Проверяем наличие make
+	if _, err := exec.LookPath("make"); err != nil {
+		return fmt.Errorf("make not found - install build-essential package")
+	}
+
+	// Проверяем наличие компилятора
+	if _, err := exec.LookPath("gcc"); err != nil {
+		return fmt.Errorf("gcc not found - install build-essential package")
+	}
+
+	// Проверяем наличие заголовков ядра
+	kernelVersion, err := getKernelVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get kernel version: %v", err)
+	}
+
+	kernelHeadersPath := fmt.Sprintf("/lib/modules/%s/build", kernelVersion)
+	if _, err := os.Stat(kernelHeadersPath); os.IsNotExist(err) {
+		return fmt.Errorf("kernel headers not found at %s - install linux-headers-%s package",
+			kernelHeadersPath, kernelVersion)
+	}
+
+	printSuccess("Build requirements check passed")
+	return nil
+}
+
+// Функция для диагностики сетевых интерфейсов и драйверов
+func debugNetworkInterfaces(interfaces []NetworkInterface) {
+	printInfo("=== Network Interface Debug Information ===")
+
+	for _, iface := range interfaces {
+		if iface.Name == "lo" {
+			continue // Skip loopback
+		}
+
+		// Получаем дополнительную информацию через разные методы
+		ethtoolDriver := getDriverViaEthtool(iface.Name)
+		sysfsDriver := getDriverViaSysfs(iface.Name)
+
+		driverType := "UNKNOWN"
+		if iface.Driver != "" {
+			if isRealtekDriver(iface.Driver) {
+				driverType = "REALTEK"
+			} else if strings.Contains(strings.ToLower(iface.Driver), "intel") ||
+				iface.Driver == "igb" || iface.Driver == "e1000e" ||
+				iface.Driver == "ixgbe" || iface.Driver == "i40e" || iface.Driver == "ice" {
+				driverType = "INTEL"
+			} else {
+				driverType = "OTHER"
+			}
+		}
+
+		printInfo(fmt.Sprintf("Interface %s:", iface.Name))
+		printInfo(fmt.Sprintf("  Current Driver: %s [%s]", iface.Driver, driverType))
+		printInfo(fmt.Sprintf("  Ethtool Driver: %s", ethtoolDriver))
+		printInfo(fmt.Sprintf("  Sysfs Driver: %s", sysfsDriver))
+		printInfo(fmt.Sprintf("  MAC: %s", iface.MAC))
+		printInfo(fmt.Sprintf("  State: %s", iface.State))
+		printInfo(fmt.Sprintf("  IP: %s", iface.IP))
+		printInfo("---")
+	}
+
+	printInfo("=== End Debug Information ===")
+}
+
+// Получение драйвера через ethtool
+func getDriverViaEthtool(interfaceName string) string {
+	cmd := exec.Command("ethtool", "-i", interfaceName)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Sprintf("ethtool_error: %v", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "driver:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return "not_found"
+}
+
+// Получение драйвера через sysfs
+func getDriverViaSysfs(interfaceName string) string {
+	driverPath := fmt.Sprintf("/sys/class/net/%s/device/driver", interfaceName)
+	if link, err := os.Readlink(driverPath); err == nil {
+		return filepath.Base(link)
+	} else {
+		return fmt.Sprintf("sysfs_error: %v", err)
+	}
+}
+
+// Функция для сохранения скомпилированного драйвера
+func saveCompiledDriver(sourceDir, driverDir, driverName, kernelVersion string) (string, error) {
+	printInfo("Saving compiled driver...")
+
+	sourcePath := filepath.Join(sourceDir, "pgdrv.ko")
+	targetFileName := getDriverFileName(driverName, kernelVersion)
+	targetPath := filepath.Join(driverDir, targetFileName)
+
+	// Создаем директорию для драйверов если она не существует
+	if err := os.MkdirAll(driverDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create driver directory %s: %v", driverDir, err)
+	}
+
+	// Копируем файл
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open source driver %s: %v", sourcePath, err)
+	}
+	defer sourceFile.Close()
+
+	targetFile, err := os.Create(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create target driver %s: %v", targetPath, err)
+	}
+	defer targetFile.Close()
+
+	// Копируем содержимое
+	if _, err := sourceFile.WriteTo(targetFile); err != nil {
+		return "", fmt.Errorf("failed to copy driver content: %v", err)
+	}
+
+	// Устанавливаем права доступа
+	if err := os.Chmod(targetPath, 0644); err != nil {
+		printWarning(fmt.Sprintf("Failed to set permissions on %s: %v", targetPath, err))
+	}
+
+	printSuccess(fmt.Sprintf("Driver saved as: %s", targetPath))
+	return targetPath, nil
 }
 
 // Driver management functions
@@ -1970,14 +2488,21 @@ func unloadNetworkDriver(driverName string) error {
 	}
 
 	printInfo(fmt.Sprintf("Unloading driver: %s", driverName))
+
+	// Сначала попробуем выгрузить по имени модуля
 	cmd := exec.Command("rmmod", driverName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("rmmod failed: %v\nOutput: %s", err, string(output))
+		// Если не получилось, попробуем форсированно
+		printWarning(fmt.Sprintf("Normal rmmod failed, trying force: %v", err))
+		cmd = exec.Command("rmmod", "-f", driverName)
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("rmmod failed: %v\nOutput: %s", err, string(output))
+		}
 	}
 
-	// Wait a moment for driver to fully unload
-	time.Sleep(1 * time.Second)
+	printSuccess(fmt.Sprintf("Driver %s unloaded successfully", driverName))
 	return nil
 }
 
@@ -1992,6 +2517,7 @@ func reloadIntelDrivers(drivers []string) {
 	}
 }
 
+// Функция для загрузки стандартного сетевого драйвера (улучшенная версия)
 func loadNetworkDriver(driverName string) error {
 	if driverName == "" {
 		return fmt.Errorf("driver name is empty")
@@ -2004,74 +2530,210 @@ func loadNetworkDriver(driverName string) error {
 		return fmt.Errorf("modprobe failed: %v\nOutput: %s", err, string(output))
 	}
 
-	// Wait a moment for driver to fully load
-	time.Sleep(2 * time.Second)
+	// Ждем загрузки драйвера с таймаутом
+	if err := waitForDriverLoad(driverName, 10); err != nil {
+		printWarning(fmt.Sprintf("Driver load verification timeout: %v", err))
+	} else {
+		printSuccess(fmt.Sprintf("Driver %s loaded successfully", driverName))
+	}
+
 	return nil
 }
 
-func loadFlashingDriver(driverDir, originalDriver string) (string, error) {
-	// Step 1: Try to use pre-compiled driver from driver_dir
-	driverPath := filepath.Join(driverDir, originalDriver+".ko")
-	if _, err := os.Stat(driverPath); err == nil {
-		printInfo(fmt.Sprintf("Found pre-compiled driver: %s", driverPath))
-		if err := loadDriverFromPath(driverPath); err == nil {
-			return driverPath, nil
-		} else {
-			printError(fmt.Sprintf("Pre-compiled driver failed to load: %v", err))
+// Функция для получения версии текущего ядра
+func getKernelVersion() (string, error) {
+	cmd := exec.Command("uname", "-r")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get kernel version: %v", err)
+	}
+
+	version := strings.TrimSpace(string(output))
+	return version, nil
+}
+
+// Функция для подготовки pgdrv драйвера с проверкой начального состояния
+func preparePgdrvDriver(driverDir, originalDriver string, primaryInterface *NetworkInterface) (string, error) {
+	printInfo("Checking initial driver state...")
+
+	// Проверяем начальное состояние
+	pgdrvLoaded, realtekActive := checkInitialDriverState(primaryInterface)
+
+	printInfo(fmt.Sprintf("Initial state: pgdrv loaded=%t, realtek active=%t", pgdrvLoaded, realtekActive))
+
+	if pgdrvLoaded && !realtekActive {
+		// Случай 1: pgdrv уже загружен и нет конфликтующих Realtek драйверов
+		printSuccess("pgdrv already loaded and no conflicting Realtek drivers - ready for flashing")
+		return "pgdrv_already_loaded", nil
+	}
+
+	if pgdrvLoaded && realtekActive {
+		// Случай 2: pgdrv загружен, но есть активный Realtek драйвер - конфликт
+		printWarning("pgdrv loaded but Realtek driver also active - resolving conflict")
+
+		// Выгружаем оба драйвера
+		if err := unloadPgdrvDriver(); err != nil {
+			printError(fmt.Sprintf("Failed to unload pgdrv: %v", err))
+		}
+		if err := unloadNetworkDriver(primaryInterface.Driver); err != nil {
+			printError(fmt.Sprintf("Failed to unload Realtek driver %s: %v", primaryInterface.Driver, err))
+		}
+
+		printInfo("Both drivers unloaded, proceeding to load clean pgdrv...")
+	} else if !pgdrvLoaded && realtekActive {
+		// Случай 3: Стандартная ситуация - pgdrv не загружен, Realtek активен
+		printInfo("Standard case: unloading Realtek driver to load pgdrv")
+		if err := unloadNetworkDriver(primaryInterface.Driver); err != nil {
+			return "", fmt.Errorf("failed to unload Realtek driver %s: %v", primaryInterface.Driver, err)
+		}
+	} else {
+		// Случай 4: Ни один драйвер не загружен
+		printInfo("No conflicting drivers found, proceeding to load pgdrv")
+	}
+
+	// Загружаем pgdrv драйвер
+	return loadFlashingDriver(driverDir, originalDriver)
+}
+
+// Заменяем функцию compileFlashingDriver на реальную реализацию
+func compileFlashingDriver(driverDir string, originalDriver string) (string, error) {
+	printInfo("Compiling rtnicpg driver from sources...")
+
+	// Проверяем наличие необходимых инструментов для компиляции
+	if err := checkBuildRequirements(); err != nil {
+		return "", fmt.Errorf("build requirements not met: %v", err)
+	}
+
+	// Ищем исходники rtnicpg
+	sourceDir, found := checkRtnicpgSources(driverDir)
+	if !found {
+		return "", fmt.Errorf("rtnicpg source directory not found in %s", driverDir)
+	}
+
+	// Сохраняем текущую директорию
+	originalDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %v", err)
+	}
+
+	// Переходим в директорию с исходниками
+	if err := os.Chdir(sourceDir); err != nil {
+		return "", fmt.Errorf("failed to change to source directory %s: %v", sourceDir, err)
+	}
+
+	// Восстанавливаем директорию при выходе
+	defer func() {
+		os.Chdir(originalDir)
+	}()
+
+	// Очищаем предыдущие артефакты сборки
+	printInfo("Cleaning previous build artifacts...")
+	cleanCmd := exec.Command("make", "clean")
+	cleanCmd.Dir = sourceDir
+	if output, err := cleanCmd.CombinedOutput(); err != nil {
+		printWarning(fmt.Sprintf("Clean failed (non-critical): %v\nOutput: %s", err, string(output)))
+	}
+
+	// Получаем версию ядра для переменной окружения
+	kernelVersion, err := getKernelVersion()
+	if err != nil {
+		return "", fmt.Errorf("failed to get kernel version: %v", err)
+	}
+
+	// Компилируем драйвер
+	printInfo("Building driver module...")
+	buildCmd := exec.Command("make", "all")
+	buildCmd.Dir = sourceDir
+	buildCmd.Env = append(os.Environ(),
+		"KERNELDIR=/lib/modules/"+kernelVersion+"/build",
+	)
+
+	output, err := buildCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("compilation failed: %v\nOutput: %s", err, string(output))
+	}
+
+	// Проверяем, что файл pgdrv.ko был создан
+	compiledDriverPath := filepath.Join(sourceDir, "pgdrv.ko")
+	if _, err := os.Stat(compiledDriverPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("compilation succeeded but pgdrv.ko not found at %s", compiledDriverPath)
+	}
+
+	printSuccess("Driver compilation completed successfully")
+
+	// Сохраняем драйвер в папку драйверов
+	savedDriverPath, err := saveCompiledDriver(sourceDir, driverDir, originalDriver, kernelVersion)
+	if err != nil {
+		return "", fmt.Errorf("failed to save compiled driver: %v", err)
+	}
+
+	return savedDriverPath, nil
+}
+
+// Функция для определения является ли драйвер Realtek'овским
+func isRealtekDriver(driverName string) bool {
+	realtekDrivers := []string{
+		"r8169",   // Realtek RTL8169/8110 PCI Gigabit Ethernet
+		"r8168",   // Realtek RTL8168 PCI Express Gigabit Ethernet
+		"rtl8169", // Alternative name
+		"rtl8168", // Alternative name
+		"r8125",   // Realtek RTL8125 2.5Gigabit Ethernet
+		"rtl8125", // Alternative name
+		"8139too", // Realtek RTL-8139 (legacy)
+		"8139cp",  // Realtek RTL-8139C+ (legacy)
+		"rtl8139", // Alternative name (legacy)
+		"r8152",   // Realtek RTL8152/RTL8153 USB Ethernet
+		"rtl8152", // Alternative name
+	}
+
+	driverLower := strings.ToLower(driverName)
+	for _, realtekDriver := range realtekDrivers {
+		if driverLower == realtekDriver {
+			return true
+		}
+	}
+	return false
+}
+
+// Функция для поиска Realtek интерфейса среди доступных (обновленная с диагностикой)
+func findRealtekInterface(interfaces []NetworkInterface) *NetworkInterface {
+	printInfo("Searching for Realtek interfaces...")
+
+	var realtekInterfaces []*NetworkInterface
+
+	// Собираем все Realtek интерфейсы
+	for i := range interfaces {
+		if interfaces[i].Driver != "" && isRealtekDriver(interfaces[i].Driver) {
+			realtekInterfaces = append(realtekInterfaces, &interfaces[i])
+			printInfo(fmt.Sprintf("Found Realtek interface: %s (Driver: %s, State: %s, IP: %s)",
+				interfaces[i].Name, interfaces[i].Driver, interfaces[i].State, interfaces[i].IP))
 		}
 	}
 
-	// Step 2: Compile new driver
-	printInfo("Compiling new flashing driver...")
-	compiledPath, err := compileFlashingDriver(driverDir, originalDriver)
-	if err != nil {
-		return "", fmt.Errorf("failed to compile driver: %v", err)
+	if len(realtekInterfaces) == 0 {
+		printWarning("No Realtek interfaces found by driver name")
+		return nil
 	}
 
-	// Step 3: Load compiled driver
-	if err := loadDriverFromPath(compiledPath); err != nil {
-		return "", fmt.Errorf("failed to load compiled driver: %v", err)
+	// Сначала ищем активный Realtek интерфейс с IP
+	for _, iface := range realtekInterfaces {
+		if iface.IP != "" && iface.State == "UP" {
+			printSuccess(fmt.Sprintf("Selected active Realtek interface with IP: %s", iface.Name))
+			return iface
+		}
 	}
 
-	return compiledPath, nil
-}
-
-func loadDriverFromPath(driverPath string) error {
-	printInfo(fmt.Sprintf("Loading driver from: %s", driverPath))
-	cmd := exec.Command("insmod", driverPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("insmod failed: %v\nOutput: %s", err, string(output))
+	// Если не нашли активный с IP, ищем активный без IP
+	for _, iface := range realtekInterfaces {
+		if iface.State == "UP" {
+			printInfo(fmt.Sprintf("Selected active Realtek interface (no IP): %s", iface.Name))
+			return iface
+		}
 	}
 
-	time.Sleep(2 * time.Second)
-	return nil
-}
-
-func compileFlashingDriver(driverDir string, originalDriver string) (string, error) {
-	// This is a simplified version - in real implementation, you would need
-	// the actual driver source code and proper compilation environment
-	printInfo("Compiling driver (this may take a few minutes)...")
-
-	// Create driver directory if it doesn't exist
-	os.MkdirAll(driverDir, 0755)
-
-	// For demonstration, we'll simulate compilation
-	// In real implementation, this would involve:
-	// 1. Finding the driver source
-	// 2. Setting up kernel headers
-	// 3. Running make
-	// 4. Installing the compiled module
-
-	compiledPath := filepath.Join(driverDir, originalDriver+".ko")
-
-	// Simulate compilation time
-	time.Sleep(3 * time.Second)
-
-	// In reality, you would run something like:
-	// cd /usr/src/driver-source && make && cp driver.ko $driverDir/
-
-	return compiledPath, fmt.Errorf("driver compilation not implemented - this requires actual driver source and build environment")
+	// Если не нашли активный, берем первый найденный
+	printWarning(fmt.Sprintf("Selected inactive Realtek interface: %s", realtekInterfaces[0].Name))
+	return realtekInterfaces[0]
 }
 
 // Flashing execution functions
