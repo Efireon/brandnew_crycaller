@@ -17,34 +17,56 @@ tests:
   parallel_groups:
     - # Группа 1: Быстрые системные тесты
       - name: "CPU Test"
-        command: "./cpu_test"
+        command: "cpu_test"
         args: ["-vis", "-c", ".data/cpu_config.json"]
         type: "standard"
         timeout: "10s"
         collapse: true
         required: true
       - name: "GPU Test"
-        command: "./gpu_test"
+        command: "gpu_test"
         args: ["-vis", "-c", ".data/gpu_config.json"]
         type: "standard"
         timeout: "10s"
-        collapse: true
+        collapse: false
         required: true
-
-    - # Вторая группа тестов
       - name: "Memory Test"
-        command: "./ram_test"
+        command: "ram_test"
         args: ["-vis", "-c", ".data/ram_config.json"]
         type: "standard"
         timeout: "10s"
-        collapse: true
+        collapse: false
+        required: true
+      - name: "Storage Test"
+        command: "./disk_test"
+        args: ["-vis", "-c", ".data/disk_config.json"]
+        type: "standard"
+        timeout: "10s"
+        collapse: false
         required: true
       - name: "Fan Test"
-        command: "./fan_test"
+        command: "fan_test"
         args: ["-vis", "-c", ".data/fan_config.json"]
         type: "standard" 
         timeout: "30s"
-        collapse: true
+        collapse: false
+        required: true
+
+    - # Вторая группа тестов
+
+      - name: "Network Test"
+        command: "network_test"
+        args: ["-vis", "-c", ".data/network_config.json"]
+        type: "standard"
+        timeout: "30s"
+        collapse: false
+        required: true
+      - name: "Power Test"
+        command: "power_test"
+        args: ["-vis", "-c", ".data/power_config.json"]
+        type: "standard" 
+        timeout: "30s"
+        collapse: false
         required: true
 
   # Последовательные группы тестов (выполняются по очереди)
